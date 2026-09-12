@@ -1,0 +1,140 @@
+name: Security
+
+# 依存とコンテナイメージに既知の脆弱性・設定不備が無いかを Trivy で見る。
+#
+# **結果を GitHub の Code Scanning(SARIF)へは送っていない。** 組織で Code Security が
+# 無効なら送っても弾かれる(有効化すると committer 単位の課金が発生する)。
+# 表形式でログに出し、CRITICAL / HIGH が出たらジョブを落とす方式にしてある。
+# 有効化したときは、各ステップを format: sarif + github/codeql-action/upload-sarif に
+# 差し替える。
+#
+# **このジョブは Ruleset の必須チェックに入れない。** 自分のコードの誤りではなく
+# 「世の中で新しく見つかった脆弱性」で赤くなるため、マージそのものを止めると
+# 身動きが取れなくなる。赤は「見て判断する合図」として扱う。
+on:
+  pull_request:
+  push:
+    branches: [master]
+  # コードが変わらなくても脆弱性は増える。新しく公表されたものを週1で拾う。
+  # (private リポジトリでは 60 日活動が無いと GitHub 側で自動停止される)
+  schedule:
+    - cron: '0 0 * * 1'   # 毎週月曜 09:00 JST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # **event_name を含める。** schedule / workflow_dispatch / master への push は
+  # どれも github.ref が refs/heads/master になるため、これが無いと同じグループに入り、
+  # 月曜の定期実行が同時刻の push に黙ってキャンセルされる
+  # (定期実行でしか走らない検査が、気付かないまま欠ける)。
+  group: security-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: 脆弱性スキャン
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # 依存に既知の脆弱性が無いか。
+      # ignore-unfixed: 修正版がまだ出ていないものは上げようが無いので、ここでは落とさない。
+      - name: 依存の脆弱性
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+          format: table
+
+      # Dockerfile の書き方の問題(root 実行、latest タグなど)。中身のパッケージは
+      # 見ない(それは下の image-scan の仕事)。
+      - name: Dockerfile の設定不備
+        # **前のステップが落ちても実行する。** 既定では失敗した時点で以降が skip されるため、
+        # 依存に CVE が出ている週は Dockerfile の検査が一度も走らなくなる。
+        # 見たいのは別々のものなので、毎回そろえて出す。
+        if: ${{ !cancelled() }}
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: Dockerfile
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+          format: table
+
+  image-scan:
+    name: イメージの脆弱性スキャン
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # master マージ後に ECR から読むための OIDC トークン。PR 時点では使わない。
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # **master マージ後は、実際に載るイメージ(ECR に push 済みのもの)を見る。**
+      # ci.yml が焼くイメージと同じ手順で焼いたものではなく、Stage・本番へそのまま載る
+      # 実物(push 済みの SHA タグ)を見ることで、「CI は緑だがイメージには脆弱性がある」
+      # 状態を見逃さない。PR 時点ではまだ ECR に無いので、その場で焼く。
+      - name: master マージ後かどうかを判定する
+        id: from-ecr
+        run: |
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/master" ]; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # master マージ後は ECR から読み直すので、読み取りの資格情報が要る。
+      # 引き受けるのは deploy-stage.yml と同じ ECR push 専用ロール(信頼するのは
+      # ref:refs/heads/master だけなので、このジョブも master への push でしか引けない)。
+      # そのロールには自分のリポジトリを pull する権限(BatchGetImage / GetDownloadUrlForLayer)も
+      # 持たせてある(templates/aws/github-oidc.yaml の GitHubEcrPushRole)。
+      #
+      # **deploy-stage.yml の push と競走する。** 同じ master への push で両方が起動し、
+      # こちらが先に走るとイメージがまだ無くて落ちる。落ちたら deploy-stage の完了後に
+      # 再実行する。確実にしたいなら、このジョブを deploy-stage.yml の push ジョブの
+      # 後続(needs:)へ移す。
+      - name: AWS を OIDC で認証する(読み取り専用)
+        if: steps.from-ecr.outputs.value == 'true'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_PUSH_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: ECR にログインする
+        if: steps.from-ecr.outputs.value == 'true'
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: イメージをビルドする(PR 時点)
+        if: steps.from-ecr.outputs.value == 'false'
+        run: docker build -t <app-ecr-repo>:scan .
+
+      - name: 対象イメージの参照を決める
+        id: image
+        run: |
+          if [ "${{ steps.from-ecr.outputs.value }}" = "true" ]; then
+            echo "ref=${{ steps.ecr-login.outputs.registry }}/<app-ecr-repo>:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=<app-ecr-repo>:scan" >> "$GITHUB_OUTPUT"
+          fi
+
+      # OS パッケージと依存の両方を見る。Dockerfile の静的な検査では出てこない層。
+      - name: イメージの脆弱性
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.image.outputs.ref }}
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+          format: table

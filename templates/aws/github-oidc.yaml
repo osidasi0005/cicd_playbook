@@ -512,6 +512,14 @@ Resources:
                   - ecr:CompleteLayerUpload
                   - ecr:BatchCheckLayerAvailability
                 Resource: !Sub arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/${AppEcrRepositoryName}
+              # push した実物を security.yml の image-scan が読み直す(Trivy が pull する)ための
+              # 読み取り。同じリポジトリの pull だけで、書き込みは上の push 5 つから増えない。
+              - Sid: PullAppImageForScan
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !Sub arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/${AppEcrRepositoryName}
 
 Outputs:
   DeployRoleArn:

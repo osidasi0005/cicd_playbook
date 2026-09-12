@@ -1,0 +1,138 @@
+name: CI
+
+# PR と master への push で回す。
+# 「ビルドとテスト」「E2E(クリティカルパス)」を master へのマージ条件にする
+# (Ruleset の Required status checks)。
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+# 既定の write を落とす。CI は読むだけでよい。
+permissions:
+  contents: read
+
+# 同じ PR に続けて push したら、古い実行は止める。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ビルドとテスト
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # ツールチェーンの用意はスタックに合わせて差し替える
+      # (setup-node + npm / setup-java + Maven / setup-python など)。
+      # バージョンはリポジトリの設定ファイル(.nvmrc、pom.xml の <java.version> 等)を
+      # 正にし、ここへ直接数字を書かない。
+      - name: ツールチェーンを用意する
+        run: |
+          echo "TODO: setup-node / setup-java などプロジェクトに合わせて差し替える"
+
+      - name: ビルドとテスト
+        run: <build command> && <test command>
+        # 例(参照実装): ./mvnw -B verify
+
+      - name: テスト結果を残す
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-reports
+          path: <test report path>
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # E2E ジョブへ渡す。ここで作った成果物をそのまま起動するので、ビルドは1回で済む。
+      #
+      # **保持期間を1日にしない。** 成果物は同じコミットからいつでも作り直せる、というのは
+      # build からやり直した場合の話で、GitHub の「Re-run failed jobs」は build を
+      # 再実行しない。PR を数日開けたまま e2e だけ再実行すると、期限切れの artifact を
+      # 取りにいき、**アプリの良し悪し以前の理由で赤くなる**(参照実装で自動レビューが指摘)。
+      - name: 成果物を E2E へ渡す
+        uses: actions/upload-artifact@v7
+        with:
+          name: app-build
+          path: <build output path>
+          retention-days: 7
+
+      # **到達形の変更点。** master マージ後の push ジョブ(deploy-stage.yml)がイメージを
+      # 焼いて stage の ECR へ push し、以降そのイメージをコミット SHA タグのまま
+      # Stage・本番へ載せ続ける(1 度焼いたイメージを使い回す。build once, deploy many)。
+      # PR の時点ではまだ承認ゲートも Ruleset も通っていないので、AWS への書き込みは
+      # まだ発生させない。ここで焼く目的は、E2E で実物を使うことと、Trivy のイメージ
+      # スキャン(security.yml)に実物を渡すこと。**push はしない。**
+      - name: イメージをビルドする(push しない)
+        run: docker build -t <app-ecr-repo>:${{ github.sha }} .
+
+  # クリティカルパスの E2E。
+  #
+  # 守るのは「売上や業務が成立する経路」だけ。**網羅はしない。** それ以外のパターンは
+  # 人手のシステムテストや探索的テストが担う前提。全部をここへ持ち込むと実行時間と
+  # 保守量が釣り合わなくなり、「落ちても直さないテスト」に変わる
+  # (development-strategy の e2e-as-a-merge-gate.md を判断基準にする)。
+  e2e:
+    name: E2E(クリティカルパス)
+    # build が緑のときだけ走らせる。ビルドも通らない変更でブラウザまで立ち上げても、
+    # 分かることは build と同じでしかない。
+    needs: build
+    runs-on: ubuntu-latest
+
+    services:
+      # 依存するミドルウェア(DB など)はここに立てる。
+      # **docker compose ではなく services で立てる。** compose を使うとアプリのイメージを
+      # ビルドし直すことになり、build ジョブで作った成果物が無駄になる
+      # (同じビルドを2回やることになる)。
+      db:
+        image: <db image>
+        env:
+          <db env var>: <value>
+        ports:
+          - <db port>:<db port>
+        options: >-
+          --health-cmd "<db readiness check command>"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: app-build
+          path: <build output path>
+
+      - name: E2E の依存を入れる
+        run: <e2e setup command>
+        # 例(参照実装): Playwright なら working-directory: e2e で npm ci
+
+      - name: アプリを起動する
+        run: |
+          <app start command> &
+          for i in $(seq 1 60); do
+            if curl -fsS <health check url> 2>/dev/null | grep -q '<healthy response marker>'; then
+              echo "アプリが起動しました($((i * 2)) 秒)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::120 秒待ってもアプリが起動しませんでした。"
+          exit 1
+
+      - name: E2E
+        run: <e2e command>
+
+      # **アプリのログも一緒に残す。** E2E が落ちたとき、原因が画面側にあるのかサーバー側の
+      # 例外なのかは、ブラウザ側の trace だけでは分からないことが多い。
+      - name: 失敗したときの手がかりを残す
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-report
+          path: <e2e report paths(複数行でよい)>
+          retention-days: 7
+          if-no-files-found: ignore

@@ -1,0 +1,152 @@
+name: deploy-stage (Stage への自動反映)
+
+# master への push で起動する。イメージを焼いて stage アカウントの ECR へ push し、
+# <infra-repo> を checkout して cdk deploy する。staging Environment には承認ゲート
+# (required reviewers)を付けない前提なので、master マージからここまで人を介さない。
+#
+# workflow_dispatch は、わざと壊した任意の ref を stage へ出すためだけの入口
+# (スモーク失敗時のロールバックが実際に効くかを、意図的に壊して確かめる用途)。
+# 通常のリリースでは使わない。stage 専用で、promote-prod.yml には同じ入力を作らない。
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      app_ref:
+        description: >-
+          【テスト専用・stage のみ】焼く対象の ref(ブランチ/タグ/SHA)。
+          空なら既定ブランチ(master)。イメージは test- 接頭辞のタグで push する。
+          普段は空のままにする
+        required: false
+        default: ""
+
+# **このワークフローは master ブランチのワークフローとして起動すること。**
+# workflow_dispatch で起動するときも、実行対象のブランチは master のままにする
+# (焼く対象の ref は app_ref 入力で別に渡す。壊れた ref を直接ブランチとして
+# 起動する形にはしない)。
+#
+# ECR push ロールの信頼条件(OIDC の sub)は「ワークフローを起動したブランチ」で決まり、
+# ref:refs/heads/master でないと AssumeRoleWithWebIdentity で弾かれる。
+# **弾かれるのが正しい**(壊れたブランチ側からロールを引けてしまうと、
+# push ロールを「master への push だけ信頼する」に絞った意味が無くなる)。
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-stage
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    name: イメージを焼いて stage へ push する
+    runs-on: ubuntu-latest
+    # **Environment を使わない。** 承認ゲートを通らないジョブに強い権限を持たせない、
+    # という設計の裏返しとして、このジョブは environment: を宣言しない
+    # (このロールが Environment を通らずに引ける唯一の例外である理由は下のコメント)。
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image-tag: ${{ steps.tag.outputs.tag }}
+      registry: ${{ steps.ecr-login.outputs.registry }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.app_ref }}
+
+      - name: タグを決める
+        id: tag
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          if [ -n "${{ inputs.app_ref }}" ]; then
+            echo "tag=test-${sha}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${sha}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # **このロールは stage アカウントにしか作らない(infra 側の github-oidc.yaml の
+      # GitHubEcrPushRole)。権限は ECR の 1 リポジトリへの push だけ
+      # (ecr:GetAuthorizationToken / PutImage / InitiateLayerUpload / UploadLayerPart /
+      # CompleteLayerUpload / BatchCheckLayerAvailability)。CloudFormation・ECS などへの
+      # 書き込みは一切付けない(デプロイ本体は次のジョブの staging デプロイ用ロールが行う)。
+      #
+      # **信頼する sub は ref:refs/heads/master だけ。pull_request は信頼しない。**
+      # PR を開いただけで AWS へ書き込める経路にはしない。master への push は
+      # Ruleset(PR 必須・必須チェック)を通らないと起きないので、ECR への push は
+      # 「CI が緑になった差分」に限られる。
+      #
+      # **ECR リポジトリはタグをイミュータブルにして作る**(infra 側の
+      # ecr-repository.yaml)。同じ SHA タグの上書きを ECR 側で拒否させ、このロールが
+      # 漏れても「検証済みの SHA と同じタグで別の中身を置く」ことはできないようにする。
+      - name: AWS を OIDC で認証する(ECR push 専用ロール)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_PUSH_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-${{ github.run_id }}
+
+      - name: ECR にログインする
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # **build once, deploy many。** ここで焼いて push したイメージ(SHA タグ、または
+      # workflow_dispatch なら test- 接頭辞のタグ)を、以降 Stage・本番へそのまま載せる。
+      # 同じ SHA のイメージをここから先で焼き直すことはない。
+      - name: イメージを焼いて push する
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker build -t "${REGISTRY}/<app-ecr-repo>:${TAG}" .
+          docker push "${REGISTRY}/<app-ecr-repo>:${TAG}"
+
+  deploy:
+    name: Stage へデプロイする
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    # staging Environment には承認ゲート(required reviewers)を付けない。
+    # master への push で、ここまで人を介さずに進む。
+    environment: staging
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: <infra-repo> を checkout する
+        uses: actions/checkout@v7
+        with:
+          repository: <owner>/<infra-repo>
+          # 別リポジトリなので GITHUB_TOKEN では届かない(Contents:Read の fine-grained PAT)。
+          token: ${{ secrets.INFRA_REPO_TOKEN }}
+          path: <infra-repo>
+
+      - uses: ./<infra-repo>/.github/actions/setup-aws
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # イメージ参照はコンテキスト変数 imageUri で渡す。スタック側は
+      # ContainerImage.fromRegistry(imageUri) のように、既存イメージの URI を
+      # そのまま受け取る前提(DockerImageAsset のようにこの場でビルドしない)。
+      # **テストは CI(app 側の ci.yml)で済んでいるので、ここでは再実行しない。**
+      - name: cdk deploy する
+        working-directory: <infra-repo>
+        env:
+          IMAGE_URI: ${{ needs.build-and-push.outputs.registry }}/<app-ecr-repo>:${{ needs.build-and-push.outputs.image-tag }}
+        run: |
+          set -euo pipefail
+          npx cdk deploy <stack-name>Stage --require-approval never --context imageUri="$IMAGE_URI"
+
+      - name: スモークテスト
+        run: <smoke test command>
+
+      # スモークが落ちたら、直前まで動いていたタスク定義に戻す(ECS のロールバックは
+      # 番号ではなく「中身」で持つ必要がある。ネイティブ Blue/Green は古いリビジョンを
+      # deregister するため、番号で戻す方式は成立しない)。
+      # スキーマ変更のようにロールバックできない差分を含む回は戻さず、通知して止める
+      # (採用先の運用・スクリプトに合わせて実装する)。
+      - name: 失敗したらロールバックする
+        if: failure()
+        run: <rollback command>

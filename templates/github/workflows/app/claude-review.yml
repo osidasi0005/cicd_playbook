@@ -1,0 +1,163 @@
+name: Claude Review
+
+# 実装したセッションとは別のコンテキストで差分を読ませる。
+# 実装時の思い込みを引き継がない状態でレビューさせることが目的なので、
+# ここでは会話の経緯を一切渡さず、リポジトリの CLAUDE.md と差分だけを根拠にさせる。
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write   # レビューコメントの投稿
+  id-token: write        # 必須。action が OIDC で GitHub App トークンを取得する
+
+# 連続で push したときは古い実行を止める(無駄な課金を防ぐ)。
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: 差分レビュー
+    # ドラフトのうちは走らせない。書きかけを読ませても指摘が的外れになるうえ課金だけ増える。
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # トークンが未登録の環境でも赤くしない。
+      # Secret はリポジトリ単位なので、リポジトリを増やすたびに登録が要る。
+      - name: トークンの有無を確認
+        id: gate
+        env:
+          TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -z "${TOKEN}" ]; then
+            echo "ready=false" >> "${GITHUB_OUTPUT}"
+            echo "::notice::CLAUDE_CODE_OAUTH_TOKEN が未登録のため、レビューをスキップしました。"
+            {
+              echo "### Claude レビューはスキップされました"
+              echo ""
+              echo "\`CLAUDE_CODE_OAUTH_TOKEN\` がこのリポジトリに登録されていません。"
+              echo "**ターミナルで \`claude\` を起動し、\`/install-github-app\` を実行**してください。"
+              echo "(\`claude setup-token\` の出力を \`gh secret set\` に渡す経路は 401 になります)"
+            } >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "ready=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Checkout repository
+        if: steps.gate.outputs.ready == 'true'
+        uses: actions/checkout@v7
+        with:
+          # base との差分を自分で取れるようにする
+          fetch-depth: 0
+
+      - name: Review the diff with Claude
+        id: claude
+        if: steps.gate.outputs.ready == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            リポジトリ: ${{ github.repository }}
+            対象PR: #${{ github.event.pull_request.number }}
+            ベースブランチ: ${{ github.event.pull_request.base.ref }}
+
+            この PR の差分をレビューし、結果を日本語で PR に投稿してください。
+
+            進め方:
+            1. リポジトリ直下の `CLAUDE.md` を Read で読む。**これがこのリポジトリの約束**であり、
+               レビューの基準になる。特に「このリポジトリでの約束」の節を出発点にする
+            2. mcp__github__get_pull_request で PR の説明を読む
+            3. mcp__github__get_pull_request_files と mcp__github__get_pull_request_diff で差分を読む
+            4. 差分の周辺コードを Read / Grep で確認する。**差分だけを見て判断しない**
+            5. 指摘を作る(基準は後述)
+            6. 投稿する
+               - 行を特定できる指摘がある場合:
+                 mcp__github__create_pending_pull_request_review でレビューを開始し、
+                 mcp__github__add_comment_to_pending_review で指摘ごとにコメントを付け、
+                 mcp__github__submit_pending_pull_request_review で event="COMMENT" として提出する
+               - 行を特定できない、または上記が失敗した場合:
+                 mcp__github__add_issue_comment で1件にまとめて投稿する
+               - **どちらか一方だけ**にする。二重に投稿しない
+
+            何を見るか:
+            - **CLAUDE.md の「レビューで見るもの」に挙がっている観点を最優先で見る。**
+              機械では判定できないから人のレビューに残されている項目である
+            - 差分が PR の説明と食い違っていないか
+            - 既存の設計・命名・書き方と揃っているか(周辺コードを読んで確認する)
+            - エラー処理の欠落、境界値、null / 空、同時実行
+            - テストが変更に追随しているか。振る舞いを変えたのにテストが無いなら指摘する
+
+            何を見ないか(重複を避ける):
+            - **CI が機械的に検査している項目は指摘しない。**
+              `.github/workflows/ci.yml` を読み、そこで既に落ちるものは書かない
+            - 整形・空白・import 順など、ビルドが通るなら影響しないもの
+            - 好みの問題。「こう書くこともできる」だけの指摘はしない
+
+            指摘の書き方:
+            - **重要度を必ず付ける。** `[要修正]` / `[検討]` / `[参考]` の3段階
+            - `[要修正]` は、**そのままマージすると壊れるものだけ**に使う
+            - 根拠を書く。「CLAUDE.md のこの約束に反する」「この行がこうなるため」
+            - 断定できないことは「〜の可能性がある」と明示する。推測と事実を混ぜない
+            - **実際に読んだファイルだけを根拠にする。** 読んでいないファイルの内容を推測で書かない
+            - 指摘が無ければ「指摘なし」と1行で書く。無理に何か書かない
+
+            守ること:
+            - **コードは一切変更しない。** レビューと投稿だけを行う
+            - PR を approve / request changes しない。event は必ず "COMMENT" にする
+            - 指摘は多くても10件までに絞る。重要なものから並べる
+
+          # --max-turns は暴走を止めるための安全装置であって、レビューの分量の目安ではない。
+          # 40 のとき、**レビューが正常に完走したのに上限超過で失敗**する PR が出た
+          # (参照実装で実測。action のログは is_error: false)。
+          # 差分レビューは必須チェックなので、これが落ちるとマージが止まる。
+          # 正常な完了を落とさない値まで上げる。ここに当たり続けるなら、上げる前に
+          # **PR が大きすぎないか**を先に疑うこと。
+          claude_args: |
+            --model claude-sonnet-5
+            --max-turns 80
+            --allowedTools "Read,Grep,Glob,mcp__github__get_pull_request,mcp__github__get_pull_request_files,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_review_comments,mcp__github__create_pending_pull_request_review,mcp__github__add_comment_to_pending_review,mcp__github__submit_pending_pull_request_review,mcp__github__add_issue_comment"
+
+      # Claude が実際にレビューしたかを判定する。
+      #
+      # outputs.conclusion が空のときは、action が自分でスキップしている。
+      # 最も多い原因は **workflow validation** で、
+      # 「このワークフローファイルがデフォルトブランチに存在し、内容が一致すること」を要求される。
+      # PR でプロンプトを書き換えて任意の指示を実行させる攻撃を防ぐための仕組みなので、
+      # **このファイル自体を変更する PR では原理的に必ずスキップされる**(マージすれば以後は動く)。
+      #
+      # ここで exit 1 すると、Ruleset の必須チェックが緑にならず PR をマージできない。
+      # マージできなければ永久にレビューが動かない、というデッドロックになる。
+      # そのため**スキップは警告にとどめ、実際に失敗したときだけ落とす**。
+      #
+      # ただし「レビューされていないのに緑」は見逃したくないので、サマリに大きく残す。
+      - name: レビューの実行状況を判定
+        if: steps.gate.outputs.ready == 'true'
+        env:
+          CONCLUSION: ${{ steps.claude.outputs.conclusion }}
+        run: |
+          if [ "${CONCLUSION}" = "success" ]; then
+            echo "### Claude レビューを実行しました" >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          if [ -z "${CONCLUSION}" ]; then
+            echo "::warning::Claude レビューは実行されていません(action 側でスキップされました)"
+            {
+              echo "### ⚠ Claude レビューは実行されていません"
+              echo ""
+              echo "action が自身の判断でスキップしました。よくある原因は **workflow validation** です。"
+              echo "\`.github/workflows/claude-review.yml\` の内容がデフォルトブランチのものと一致しない PR では、"
+              echo "**原理的に必ずスキップされます**(PR でプロンプトを書き換える攻撃を防ぐ仕組み)。"
+              echo ""
+              echo "**この PR の差分は誰にもレビューされていません。目視で確認してください。**"
+              echo "このファイルを変更していない PR でこれが出る場合は、実行ログを確認してください。"
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          echo "::error::Claude の実行が失敗しました(conclusion=${CONCLUSION})"
+          exit 1
