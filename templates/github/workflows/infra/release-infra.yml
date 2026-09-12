@@ -1,0 +1,150 @@
+name: release-infra (インフラ定義だけを反映する)
+
+# **インフラ定義(スタックそのもの)を変えたときの手動起動。**
+# アプリの変更を Stage・本番へ反映する経路は <app-repo> 側の deploy-stage.yml /
+# promote-prod.yml に移っている(このリポジトリだけではアプリの現在のイメージを
+# 知らない)。ここはインフラの変更だけを届けるためのもの。
+#
+# **到達形の変更点。** 参照実装ではここに app_ref(アプリ側の取得先を差し替える入力)が
+# あったが、「わざと壊したアプリを stage へ出す」役目は <app-repo> 側の
+# deploy-stage.yml の workflow_dispatch 入力(app_ref)へ移った。ここは
+# インフラ定義だけを変えるためのものなので、その入力は持たない。
+
+run-name: >-
+  release-infra: ${{ inputs.environment }}${{ inputs.verification && ' [検証]' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 反映先の環境
+        type: choice
+        required: true
+        default: stage
+        options:
+          - stage
+          - prod
+      region:
+        description: 対象リージョン。空なら変数 AWS_REGION
+        required: false
+        default: ""
+      image_uri:
+        description: >-
+          反映する既存イメージの URI(<registry>/<app-ecr-repo>:<sha> または
+          @sha256:... のダイジェスト指定)。空なら、そのスタックに現在デプロイ済みの
+          イメージを変えずにインフラ定義だけを反映する(スタック側の実装に依存する)
+        required: false
+        default: ""
+      dry_run:
+        description: テストと cdk diff まで行い、AWS へは反映しない
+        type: boolean
+        required: false
+        default: false
+      skip_tests:
+        description: テストを飛ばす
+        type: boolean
+        required: false
+        default: false
+      note:
+        description: リリース記録に残す備考
+        required: false
+        default: ""
+      # **検証目的の実行であることを、後から機械で分かる形に残すための入力。**
+      # わざと失敗させる回は、変更失敗率の分母にも分子にも入れてはいけない。
+      # workflow_dispatch の入力値そのものは実行履歴の API から読めないので、
+      # 集計は run-name(上)の印を見る。
+      verification:
+        description: 【検証目的】わざと失敗させる回。実行名に印が付き、DORA 相当の集計から外れる
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  id-token: write   # OIDC
+  contents: read
+
+concurrency:
+  group: <project>-infra-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # **この 2 つの名前は infra/github-oidc.yaml の Mappings.EnvironmentConfig にある
+    # GitHubEnvironment と一致していること。** 合っていないと AssumeRoleWithWebIdentity
+    # で弾かれる(名前はここ・deploy-infra.yml・テンプレートの 3 か所にある)。
+    environment: ${{ inputs.environment == 'prod' && 'production' || 'staging' }}
+    timeout-minutes: 60
+    env:
+      REGION: ${{ inputs.region || vars.AWS_REGION }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # release スクリプトが「前回リリースからのコミット一覧」を出すために履歴を
+          # 遡ることがある。浅い clone だとその範囲が解決できず、一覧が空になる。
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-aws
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.REGION }}
+
+      - name: リリースする
+        env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          SKIP_TESTS: ${{ inputs.skip_tests }}
+          IMAGE_URI: ${{ inputs.image_uri }}
+          NOTE: ${{ inputs.note }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          args=(--yes --env "$DEPLOY_ENV" --region "$REGION")
+          # if で書く。`[ ... ] && args+=(...)` は set -e と組み合わせると
+          # 最後の行に来たときだけステップが失敗するという読みにくい罠になる。
+          if [ "${DRY_RUN:-false}" = "true" ]; then args+=(--dry-run); fi
+          if [ "${SKIP_TESTS:-false}" = "true" ]; then args+=(--skip-tests); fi
+          if [ -n "${IMAGE_URI:-}" ]; then args+=(--image-uri "$IMAGE_URI"); fi
+
+          note="GitHub Actions / ${ACTOR} / ${SHA:0:7}"
+          if [ -n "${NOTE:-}" ]; then note="${note} / ${NOTE}"; fi
+          args+=(--note "$note")
+
+          node scripts/release.mjs "${args[@]}"
+        # scripts/release.mjs は参照実装から未一般化。採用先で用意する
+        # (--image-uri のような、既存イメージをそのまま渡すオプションを足す)。
+
+      # release スクリプトが RELEASES.md 相当へ1件追記する想定なら、その追記分を
+      # ジョブ要約に写す。
+      #
+      # **master へ push しようとしてはいけない。** Ruleset(PR 必須・必須チェック)を
+      # 通さない直 push は弾かれる。履歴はジョブ要約に残せば足りるので、
+      # リポジトリへの書き戻しは手元から実行したときだけにする。
+      #
+      # **success() ではなく always() にする。** リリースが失敗しても
+      # (スモークが落ちてロールバックした、など)その顛末を記録に書くスクリプトなら、
+      # success() だと**残す価値が最も高い失敗の記録だけが残らない**。
+      - name: リリース記録をジョブ要約に残す
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f RELEASES.md ] || git diff --quiet -- RELEASES.md; then
+            echo "追記はありません" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "## リリース記録"
+            echo
+            echo '```markdown'
+            git diff --unified=0 -- RELEASES.md | grep '^+' | grep -v '^+++' | cut -c2-
+            echo '```'
+            echo
+            echo "> この記録はリポジトリには残らない(master はブランチ保護で直 push できない)。"
+            echo "> 残すならこの要約を控えるか、手元から \`node scripts/release.mjs\` を実行する。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 出力を片付ける
+        if: always()
+        run: rm -f .env.aws .env.aws.stage cdk-outputs.json cdk-outputs.stage.json

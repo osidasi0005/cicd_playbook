@@ -49,6 +49,7 @@ OIDC → アカウント分離 → build once → IaC → 既定ブランチ保�
 - [ ] `allow_auto_merge` を有効にする(同じく Free の private では使えない)
 - [ ] Variables: `AWS_REGION`、`STAGE_ECR_REGISTRY` / `PROD_ECR_REGISTRY`(`<account>.dkr.ecr.<region>.amazonaws.com`)
 - [ ] Secrets: `CLAUDE_CODE_OAUTH_TOKEN` は `/install-github-app` でしか登録できない(`claude setup-token` の出力を `gh secret set` する経路は 401)
+- [ ] Secrets: `<app-repo>` に `INFRA_REPO_TOKEN`(`<infra-repo>` を checkout するための fine-grained PAT、Contents: Read だけ)。`GITHUB_TOKEN` は別リポジトリに届かない。期限が切れると stage への反映と本番昇格が両方止まるので、期限を控えておく
 - [ ] `templates/github/dependabot.yml` を置く。**composite action のディレクトリは別項目として書かないと見てもらえない**
 
 ## 4. CI を入れる(PR 1 本目)

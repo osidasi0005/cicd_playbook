@@ -1,0 +1,95 @@
+name: deploy-infra (初期構築)
+
+# 空の AWS アカウントに一式を作る。ここから課金が始まるので手動実行のみ。
+# 動いているものへの反映は release-infra.yml、または <app-repo> 側の
+# deploy-stage.yml / promote-prod.yml(アプリの変更を反映する経路)を使う。
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: デプロイ先の環境
+        type: choice
+        required: true
+        default: stage
+        options:
+          - stage
+          - prod
+      region:
+        description: デプロイ先リージョン
+        required: false
+        default: <aws-region>
+      confirm:
+        description: 課金の確認。deploy と入力する
+        required: true
+        default: ""
+
+permissions:
+  id-token: write   # OIDC トークンの発行に要る
+  contents: read
+
+# release-infra.yml と同じグループにする(同じスタックを2つのジョブが同時に触らないように)。
+# **環境ごとに分ける。** prod と stage は別スタックなので、待たせる理由が無い。
+# cancel-in-progress はしない。CloudFormation の途中で止めると復旧が面倒になる。
+concurrency:
+  group: <project>-infra-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # この environment を使うことが、OIDC ロールを引き受ける条件そのもの
+    # (信頼ポリシーの sub が repo:<owner>/<infra-repo>:environment:<name>、
+    # および repo:<owner>/<app-repo>:environment:<name>)。承認者を設定しておけば、
+    # 承認されるまで AWS の資格情報を取りにいかない。
+    # **この 2 つの名前(staging / production)は、infra/github-oidc.yaml の
+    # Mappings.EnvironmentConfig にある GitHubEnvironment と一致していること。**
+    # 合っていないと AssumeRoleWithWebIdentity で弾かれる。
+    environment: ${{ inputs.environment == 'prod' && 'production' || 'staging' }}
+    # 初回構築は VPC・ロードバランサ・CDN の作成、イメージの用意、起動待ちが積み上がる。
+    # 60 分では足りないことがある。
+    timeout-minutes: 90
+
+    steps:
+      - name: 課金の確認を検証する
+        if: inputs.confirm != 'deploy'
+        run: |
+          echo "::error::confirm に deploy と入力してください(稼働している間ずっと課金が発生します)"
+          exit 1
+
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-aws
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ inputs.region }}
+          # 既定の 1 時間だと、初回構築の途中で切れることがある
+          # (切れると cdk deploy が認証エラーで落ち、後始末は手元作業になる)。
+          role-duration-seconds: "7200"
+
+      # --no-credentials: 管理者パスワードや API トークンをログにも出さない。
+      # Actions のログはリポジトリの read 権限があれば誰でも読めるため。
+      #
+      # --skip-bootstrap: cdk bootstrap は IAM ロールと S3 バケットを作る操作で、
+      # 管理者相当の権限が要る。それを OIDC ロールに持たせると最小権限にした意味が
+      # 薄れるので、ブートストラップは手元で一度だけ済ませておく前提にする。
+      #
+      # **到達形の変更点。** アプリのイメージはこのスタックの外(ECR)にある既存の URI を
+      # 参照する。空のアカウントには参照先の ECR イメージがまだ無いので、
+      # deploy スクリプト側に「指定 SHA のイメージが無ければ手元で焼いて push する」
+      # 工程を足しておく(既存の「済んでいれば飛ばす」の一つとして)。
+      # stage の初回はこれで、prod の初回は stage からのコピー(promote-prod.yml と同じ経路)
+      # で埋める。**ECR リポジトリはこのスタックの外に置く**(前準備、または
+      # deploy-stage.yml が最初に一度だけ作る小さなスタック)。アプリのスタックを
+      # destroy してもイメージが消えないようにするため。
+      - name: デプロイする
+        env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+          REGION: ${{ inputs.region }}
+        run: |
+          set -euo pipefail
+          node scripts/deploy.mjs --yes --no-credentials --skip-bootstrap --env "$DEPLOY_ENV" --region "$REGION"
+        # scripts/deploy.mjs は参照実装から未一般化。採用先で用意する。
+
+      - name: 出力を片付ける
+        if: always()
+        run: rm -f cdk-outputs.json cdk-outputs.stage.json .env.aws .env.aws.stage

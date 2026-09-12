@@ -1,0 +1,123 @@
+# 依存の更新 PR を Dependabot に作らせる。
+#
+# Renovate ではなく Dependabot を使う。Renovate は GitHub App のインストールが要るのに対し、
+# Dependabot はこのファイルだけで動き、private リポジトリでも追加課金が無い。
+#
+# **Dependabot が作った PR では Actions の Secret が読めない**(GitHub の仕様。
+# Dependabot 専用の Secret 置き場が別にあり、通常の Secret は空になる)。
+# claude-review.yml はトークン未登録と判断してレビューをスキップし、必須チェックは
+# 緑のまま終わる(マージは止まらない)。**依存更新の PR だけは自動レビューが付かないので、
+# 目視で確認してからマージし、auto-merge の対象にもしない。**
+#
+# **このファイルは <app-repo> と <infra-repo> の両方に置く前提。**
+# 使っていないエコシステムのブロックは、各ブロックのコメントに書いた条件で削除する。
+version: 2
+
+updates:
+  # ワークフローが使う action 自体の更新(actions/checkout@v7 など)。
+  # 放っておくと、ある日 GitHub 側で動かなくなる(Node 16 の action がそうだった)。
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      # minor / patch はまとめて1本にする。major は個別の PR に分かれるので、
+      # 破壊的変更を含む1本のせいで無関係な action の更新まで足止めされることがない。
+      #
+      # **ただし action を `@v7` のような動くタグで参照している間、ここに入る更新は
+      # ほとんど来ない。** minor / patch は同じタグのまま差し替わるので Dependabot からは
+      # 見えず、PR が立つのは v7 → v8 のときだけになる(実質すべて個別 PR)。
+      # SHA でピン留めするようになったら、この設定が効き始める。
+      actions-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # **composite action は別のディレクトリとして書かないと見てもらえない。**
+  # github-actions エコシステムの `directory: /` は `.github/workflows/` しか見ず、
+  # `.github/actions/*/action.yml` の `uses:` は更新対象に入らない。
+  #
+  # **<infra-repo> 側にだけ置く。** setup-aws action の実体は <infra-repo> にあるので、
+  # <app-repo> のリポジトリではこのブロックを削除する。
+  - package-ecosystem: github-actions
+    directory: /.github/actions/setup-aws
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      setup-aws-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # アプリ / スタックの本体依存。npm(Node)を例にしている。
+  # **Maven や他の言語エコシステムを使うリポジトリでは、この package-ecosystem を
+  # 該当するもの(maven / pip / bundler など)に差し替える。**
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      npm-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      # **`@types/node` は Node 本体と一緒に上げる。**
+      # 型だけ先に上がると、CI の Node に存在しない API が型検査を通ってしまう
+      # (落ちるのは実行時)。Dependabot はこのずれを検知できない。
+      # 上げるときは `.nvmrc` と一緒に手で上げる。
+      - dependency-name: "@types/node"
+        update-types: [version-update:semver-major]
+
+  # E2E(例: Playwright)の依存。**マニフェストが e2e/ 配下にあるリポジトリだけに要る。**
+  # `directory` はマニフェストのある場所を指すので、直下に package.json が無いリポジトリで
+  # `directory: /` を指定しても npm の更新 PR は一本も来ない。
+  # この構成で E2E を持たないリポジトリでは、このブロックを削除する。
+  - package-ecosystem: npm
+    directory: /e2e
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      npm-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # コンテナイメージのベース。**<app-repo> にだけ要る。**
+  # <infra-repo> は通常 Dockerfile を持たない(ECR の既存イメージを URI で参照するだけ)
+  # ので、<infra-repo> ではこのブロックを削除する。
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: chore
+      include: scope

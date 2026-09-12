@@ -1,0 +1,95 @@
+name: CI
+
+# PR と master への push で回す。「ビルドとテスト」を master へのマージ条件にする
+# (Ruleset の Required status checks)。
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ビルドとテスト
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          # **Node のバージョンは .nvmrc が正。** ここに直接書くと上げ忘れる場所が散らばる。
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      # **到達形の変更点。** 参照実装ではスタックが DockerImageAsset(ビルドコンテキストと
+      # してアプリのソースを参照)を持ち、CI に兄弟リポジトリが無いと
+      # «CannotFindImageDirectory» で落ちるため、ダミーの Dockerfile を用意する工程が
+      # ここにあった。到達形ではスタックが ECR の既存イメージ(URI)を参照するだけになり、
+      # CDK アプリはアプリのソースを一切必要としないので、この手当ては丸ごと不要になる。
+
+      - name: 型チェック
+        run: npm run build
+
+      - name: スタックのテスト
+        run: npm test
+
+      # synth は AWS 資格情報を必要としない(env-agnostic なスタックのため)。
+      # ここを CI で回すことで、型は通るが合成できない変更を止められる。
+      # ただし synth が通ることはデプロイできることを意味しない。実デプロイでしか出ない
+      # 失敗は残る。
+      - name: 合成できること
+        run: npx cdk synth --quiet
+
+      # 「デプロイ時にしか失敗しない」ものを、synth 済みテンプレートの段階で捕まえる。
+      # IAM ロールや SecurityGroup の説明文に非 ASCII 文字があると、synth も型チェックも
+      # 通るのに CloudFormation が実行時に弾く。
+      - name: 生成テンプレートの説明文に非 ASCII 文字が無いこと
+        run: |
+          node -e "
+            const fs = require('fs');
+            const files = fs.readdirSync('cdk.out').filter(f => f.endsWith('.template.json'));
+            const KEYS = ['Description', 'GroupDescription'];
+            const bad = [];
+            for (const f of files) {
+              const t = JSON.parse(fs.readFileSync('cdk.out/' + f, 'utf8'));
+              for (const [id, res] of Object.entries(t.Resources || {})) {
+                const p = res.Properties || {};
+                for (const k of KEYS) {
+                  if (typeof p[k] === 'string' && /[^\x00-\x7F]/.test(p[k])) bad.push(f + '  ' + id + '.' + k + ' = ' + p[k]);
+                }
+                for (const rule of [].concat(p.SecurityGroupIngress || [], p.SecurityGroupEgress || [])) {
+                  if (rule && typeof rule.Description === 'string' && /[^\x00-\x7F]/.test(rule.Description)) {
+                    bad.push(f + '  ' + id + ' のルール = ' + rule.Description);
+                  }
+                }
+              }
+            }
+            if (bad.length) {
+              console.error('::error::IAM / SecurityGroup の説明文に非 ASCII 文字があります。synth は通りますがデプロイで失敗します。');
+              bad.forEach(b => console.error(b));
+              process.exit(1);
+            }
+            console.log('OK: 説明文はすべて ASCII です(' + files.length + ' テンプレート)');
+          "
+
+      # **任意。** OIDC のロール定義のような、CDK アプリの外にある手書きの CloudFormation
+      # テンプレート(このリポジトリなら templates/aws/ 相当)を持つ場合だけ要る。
+      # 上の検査は cdk.out しか見ないので、そちらは素通りする。
+      # 手書きテンプレートが無いリポジトリでは、この工程ごと削ってよい。
+      - name: 手書きテンプレートの説明文に非 ASCII 文字が無いこと
+        run: node .github/scripts/check-infra-templates.mjs .
+        # このスクリプトは参照実装から未一般化。採用先で用意する
+        # (cicd_playbook リポジトリの templates/aws/scripts/check-infra-templates.mjs が実例)。
+
+      # **Node の下限が、ファイル間で食い違っていないこと。**
+      - name: Node の下限が揃っていること
+        run: node .github/scripts/check-node-version.mjs

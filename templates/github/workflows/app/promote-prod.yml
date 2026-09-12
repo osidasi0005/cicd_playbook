@@ -1,0 +1,112 @@
+name: promote-prod (本番への昇格)
+
+# Stage で確認できたコミットにタグ v* を打つと起動する。**ビルドはしない。**
+# Stage に載っているのと同じイメージを、ダイジェストで同一性を確かめてから本番へ載せる。
+# タグは付け替えられるので「同じタグ」は「同じイメージ」の証明にならない —
+# 同一性はタグではなくダイジェストで確かめる。
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote-prod
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: 本番へ昇格する
+    runs-on: ubuntu-latest
+    # **production Environment の承認ゲートで止まる。** 承認者が確認してから進める。
+    # production Environment の Deployment branches and tags には v* を許可しておく
+    # (それ以外のブランチ・タグからは、そもそもこの Environment を通れない)。
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: <infra-repo> を checkout する
+        uses: actions/checkout@v7
+        with:
+          repository: <owner>/<infra-repo>
+          token: ${{ secrets.INFRA_REPO_TOKEN }}
+          path: <infra-repo>
+
+      - uses: ./<infra-repo>/.github/actions/setup-aws
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # **このタグが指すコミットの SHA タグで、stage の ECR にはすでにイメージがある**
+      # (deploy-stage.yml が master マージ後に push したもの)。まずそのダイジェストを控える。
+      - name: stage の ECR からダイジェストを取得する
+        id: stage-image
+        env:
+          STAGE_REGISTRY: ${{ vars.STAGE_ECR_REGISTRY }}
+        run: |
+          set -euo pipefail
+          sha="${GITHUB_SHA}"
+          # STAGE_ECR_REGISTRY は "<account>.dkr.ecr.<region>.amazonaws.com" の形。
+          # 先頭の "." 区切り最初の要素が stage アカウント ID(ECR の registry-id)。
+          registry_id="$(echo "${STAGE_REGISTRY}" | cut -d. -f1)"
+          digest="$(aws ecr batch-get-image \
+            --repository-name <app-ecr-repo> \
+            --registry-id "${registry_id}" \
+            --image-ids imageTag="${sha}" \
+            --query 'images[0].imageId.imageDigest' --output text)"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      # **stage 側は読まれるだけ、prod 側は自分で書く。**
+      # pull の許可は stage の ECR のリポジトリポリシーで prod のロールに与える
+      # (infra 側の ecr-repository.yaml)。push の許可は本番側の GitHubDeployRole に
+      # identity ベースで持たせる(ecr:GetAuthorizationToken はリソースポリシーでは
+      # 代替できないため。infra 側の github-oidc.yaml を参照)。
+      - name: stage からダイジェスト指定で pull し、prod へ push する
+        env:
+          STAGE_REGISTRY: ${{ vars.STAGE_ECR_REGISTRY }}
+          PROD_REGISTRY: ${{ vars.PROD_ECR_REGISTRY }}
+          DIGEST: ${{ steps.stage-image.outputs.digest }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "${AWS_REGION}" | \
+            docker login --username AWS --password-stdin "${STAGE_REGISTRY}"
+          aws ecr get-login-password --region "${AWS_REGION}" | \
+            docker login --username AWS --password-stdin "${PROD_REGISTRY}"
+          docker pull "${STAGE_REGISTRY}/<app-ecr-repo>@${DIGEST}"
+          docker tag "${STAGE_REGISTRY}/<app-ecr-repo>@${DIGEST}" "${PROD_REGISTRY}/<app-ecr-repo>:${GITHUB_REF_NAME}"
+          docker push "${PROD_REGISTRY}/<app-ecr-repo>:${GITHUB_REF_NAME}"
+
+      # コピーしただけで安心しない。push した先のダイジェストを読み直し、
+      # stage から取ってきたダイジェストと一致することを確かめてから初めてデプロイに進む。
+      - name: push したイメージのダイジェストが一致することを確かめる
+        env:
+          EXPECTED: ${{ steps.stage-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          actual="$(aws ecr describe-images \
+            --repository-name <app-ecr-repo> \
+            --image-ids imageTag="${GITHUB_REF_NAME}" \
+            --query 'imageDetails[0].imageDigest' --output text)"
+          if [ "$actual" != "$EXPECTED" ]; then
+            echo "::error::ダイジェストが一致しません(stage: ${EXPECTED} / prod: ${actual})。デプロイを中止します。"
+            exit 1
+          fi
+          echo "OK: ダイジェストが一致しています(${actual})"
+
+      # イメージ参照はダイジェストで渡す(タグではない)。スタック側は
+      # ContainerImage.fromRegistry(imageUri) のように、既存イメージの URI を
+      # そのまま受け取る前提。**テストは CI で済んでいるので、ここでは再実行しない。**
+      - name: cdk deploy する
+        working-directory: <infra-repo>
+        env:
+          IMAGE_URI: ${{ vars.PROD_ECR_REGISTRY }}/<app-ecr-repo>@${{ steps.stage-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          npx cdk deploy <stack-name> --require-approval never --context imageUri="$IMAGE_URI"
+
+      - name: スモークテスト
+        run: <smoke test command>

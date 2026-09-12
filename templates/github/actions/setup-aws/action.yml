@@ -1,0 +1,81 @@
+name: setup-aws
+description: >-
+  deploy / release 系のワークフローが共通で必要とする土台(<infra-repo> の依存を入れて、
+  OIDC で AWS の一時資格情報を取る)を用意する。
+
+# **この action は <infra-repo> に置く。**
+# 呼び出し元がアプリ側リポジトリ(<app-repo>)のワークフローなら、先に <infra-repo> を
+# path: <infra-repo> で checkout したうえで `uses: ./<infra-repo>/.github/actions/setup-aws`
+# の形で呼ぶ。呼び出し元がインフラ側リポジトリ(<infra-repo>)自身のワークフローなら、
+# 自分のリポジトリ内なので `uses: ./.github/actions/setup-aws` でよい。
+#
+# **参照実装との違い。** 参照実装ではこの action がアプリ側リポジトリを兄弟ディレクトリへ
+# 追加で checkout していた(スタックが DockerImageAsset としてアプリのソースを
+# ビルドコンテキストに使っていたため)。到達形ではスタックが ECR の既存イメージを
+# URI で参照するだけになるので、この action はアプリのソースを取得しない。
+# 呼び出し元(アプリ側ワークフロー)は、そもそも自分自身がアプリのソースを
+# 既にチェックアウト済みの状態でこの action を呼ぶ。
+
+inputs:
+  role-to-assume:
+    description: OIDC で引き受ける IAM ロールの ARN(変数 AWS_DEPLOY_ROLE_ARN を渡す想定)。
+    required: true
+  aws-region:
+    description: 操作対象のリージョン。
+    required: true
+  role-duration-seconds:
+    description: >-
+      一時資格情報の有効期間(秒)。ロールの MaxSessionDuration が上限。
+      既定の 3600 で足りない初回構築だけ、呼ぶ側で延ばす。
+    required: false
+    default: "3600"
+
+runs:
+  using: composite
+  steps:
+    # このファイル自身(action.yml)は <infra-repo>/.github/actions/setup-aws/ にある。
+    # 呼び出し元は <infra-repo> という「名前」を自由に選べる(checkout の path: に何を
+    # 指定するかは呼ぶ側次第)ので、ここでは github.action_path から3階層さかのぼって
+    # 実際のチェックアウト先を求める(ハードコードすると採用先ごとに書き換えが要る)。
+    # setup-aws → actions → .github → <infra-repo のルート> の3段。
+    - name: <infra-repo> のチェックアウト先を特定する
+      id: paths
+      shell: bash
+      run: |
+        set -euo pipefail
+        infra_dir="$(cd "${{ github.action_path }}/../../.." && pwd)"
+        echo "infra_dir=${infra_dir}" >> "$GITHUB_OUTPUT"
+
+    - name: Node.js を用意する
+      uses: actions/setup-node@v7
+      with:
+        # バージョンは <infra-repo> の .nvmrc が正(呼び出し元の言語と違うことがあるので、
+        # 明示的にこのパスを指す)。
+        node-version-file: ${{ steps.paths.outputs.infra_dir }}/.nvmrc
+        cache: npm
+        cache-dependency-path: ${{ steps.paths.outputs.infra_dir }}/package-lock.json
+
+    - name: <infra-repo> の依存を入れる
+      shell: bash
+      working-directory: ${{ steps.paths.outputs.infra_dir }}
+      run: npm ci
+
+    # 長期のアクセスキーは置かない。ジョブごとに、期限つきの一時資格情報を取る。
+    # 長さは role-duration-seconds(既定 1 時間)で決める。
+    - name: AWS を OIDC で認証する
+      uses: aws-actions/configure-aws-credentials@v6
+      with:
+        role-to-assume: ${{ inputs.role-to-assume }}
+        aws-region: ${{ inputs.aws-region }}
+        role-session-name: gha-${{ github.run_id }}
+        role-duration-seconds: ${{ inputs.role-duration-seconds }}
+
+    # スクリプトの「前提を確認する」工程と同じ確認を先に済ませ、欠けているならここで落とす。
+    # デプロイスクリプトの途中で落ちるより、どの前提が欠けたか読み取りやすい。
+    - name: 前提を確認する
+      shell: bash
+      run: |
+        set -euo pipefail
+        aws --version
+        aws sts get-caller-identity --query Account --output text
+        echo "前提は揃っています"

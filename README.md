@@ -21,13 +21,17 @@ docs/
   adoption-checklist.md   新プロジェクトに入れるときの手順と確認項目
 templates/
   github/
-    workflows/            ci / build-and-push / deploy-stage / promote-prod / release-infra / security / claude-review
+    workflows/
+      app/                アプリ側リポジトリに置く: ci / security / claude-review / deploy-stage / promote-prod
+      infra/              インフラ側リポジトリに置く: ci / security / claude-review / deploy-infra / release-infra
     actions/setup-aws/    複合アクション(checkout → Node → npm ci → OIDC → 前提確認)
-    scripts/              CI が md と workflow を検査するスクリプト
+    scripts/              CI が md の Node 下限表記を検査するスクリプト
     dependabot.yml
   aws/
-    github-oidc.yaml      OIDC プロバイダとデプロイロール(CloudFormation)
+    github-oidc.yaml      OIDC プロバイダ、デプロイロール、stage 専用の ECR push ロール(CloudFormation)
+    ecr-repository.yaml   アプリのスタックの外に置く ECR(イミュータブル)
     scp/                  Organizations の SCP 3 本
+    scripts/              IAM の説明文が ASCII かを検査するスクリプト
 ```
 
 `templates/` はコピーして固有名を置き換えて使う。置き換える場所は `<app-repo>` のような
@@ -39,10 +43,12 @@ CDK の construct(Blue/Green + alarms)とデプロイスクリプトは、まだ
 ([repository-boundaries.md](https://github.com/cosugi-system-organization/development-strategy/blob/master/ci-cd/repository-boundaries.md):
 一緒に変わるものだけを同居させる)。
 
-## 採用の手順
+## 読む順番
 
-`docs/adoption-checklist.md` に着手順と確認項目をまとめる(次の PR で入る)。
-先に `docs/pipeline.md` で流れを、`docs/decisions.md` で「なぜ標準どおりにしないか」を読む。
+1. [docs/pipeline.md](docs/pipeline.md) で流れを掴む
+2. [docs/decisions.md](docs/decisions.md) で「なぜ標準どおりにしないか」と、その前提を読む(前提が違えば標準に戻す)
+3. [docs/adoption-checklist.md](docs/adoption-checklist.md) の着手順に沿って入れる。AWS 側の適用順は [templates/aws/README.md](templates/aws/README.md)、
+   GitHub 側の置き方とプレースホルダの一覧は [templates/github/README.md](templates/github/README.md)
 
 ## 参照実装
 

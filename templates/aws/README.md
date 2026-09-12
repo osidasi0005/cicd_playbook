@@ -82,8 +82,10 @@ prod の ARN を差すだけで本番を触れる穴になる)。
 | app / infra 両方の Environment `staging` | `AWS_DEPLOY_ROLE_ARN` | `github-oidc.yaml`(stage)の `DeployRoleArn` |
 | app 側のリポジトリ変数 | `AWS_ECR_PUSH_ROLE_ARN` | `github-oidc.yaml`(stage)の `EcrPushRoleArn` |
 | app / infra 両方のリポジトリ変数 | `AWS_REGION` | 例: `ap-northeast-1` |
-| app 側のリポジトリ変数 | `STAGE_ECR_REGISTRY` | stage の `ecr-repository.yaml` の `RepositoryUri` からリポジトリ名を除いた `<account>.dkr.ecr.<region>.amazonaws.com` |
-| app 側のリポジトリ変数 | `PROD_ECR_REGISTRY` | prod 側の同じ形。本番昇格が stage から pull して prod へ push するときの行き先 |
+| app 側の Environment `production` | `STAGE_ECR_REGISTRY` | stage の `ecr-repository.yaml` の `RepositoryUri` からリポジトリ名を除いた `<account>.dkr.ecr.<region>.amazonaws.com`。本番昇格が pull する元 |
+| app 側の Environment `production` | `PROD_ECR_REGISTRY` | prod 側の同じ形。本番昇格が push する先 |
+
+stage へのデプロイ(`deploy-stage.yml`)は ECR ログイン時に返るレジストリをそのまま使うので、stage 用のレジストリ変数は要らない。
 
 `templates/github/workflows/` 側の雛形はこの名前で読む。
 
