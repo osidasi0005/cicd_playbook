@@ -1,0 +1,47 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyUnapprovedRegions",
+      "Effect": "Deny",
+      "NotAction": [
+        "iam:*",
+        "sts:*",
+        "organizations:*",
+        "account:*",
+        "kms:*",
+        "acm:*",
+        "cloudfront:*",
+        "route53:*",
+        "route53domains:*",
+        "globalaccelerator:*",
+        "waf:*",
+        "wafv2:*",
+        "shield:*",
+        "support:*",
+        "trustedadvisor:*",
+        "health:*",
+        "budgets:*",
+        "ce:*",
+        "cur:*",
+        "pricing:*",
+        "aws-portal:*",
+        "s3:ListAllMyBuckets",
+        "s3:GetAccountPublic*",
+        "s3:PutAccountPublic*",
+        "ec2:DescribeRegions",
+        "ec2:DescribeTransitGateways",
+        "ec2:DescribeVpnGateways"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:RequestedRegion": [
+            "ap-northeast-1",
+            "us-east-1"
+          ]
+        }
+      }
+    }
+  ]
+}

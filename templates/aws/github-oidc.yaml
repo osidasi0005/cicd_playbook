@@ -1,0 +1,540 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# GitHub Actions が AWS を触るための OIDC プロバイダと IAM ロールを作る雛形。
+#
+# 参照実装から一般化した。参照実装では「アプリとインフラが別リポジトリで、
+# デプロイの起点はアプリ側にある」到達形を前提にしており、この雛形もそれに合わせてある。
+# 信頼する GitHub リポジトリは app(アプリ側。デプロイの起点)と infra(インフラ定義側。
+# 手動リリース用)の 2 つ。
+#
+# これは「一度だけ、手元から管理者資格情報で」流すテンプレート。
+# アプリ本体の CDK アプリ(または相当するスタック定義)には含めない。
+# 寿命が違う(ロールは prod / stage のアプリスタックを作り直しても残す)ため。
+#
+# **Windows から流すときは AWS_CLI_FILE_ENCODING=UTF-8 を先に設定する。**
+# AWS CLI は --template-file を cp932 で読むため、この日本語コメントで
+# 'cp932' codec can't decode byte ... と言って弾く(テンプレート自体は壊れていない)。
+#
+# **prod と stage は別の AWS アカウントの想定なので、それぞれのアカウントで 1 回ずつ流す。**
+# TargetEnvironment がそのアカウントの担当環境で、信頼する GitHub Environment も
+# 触れる CloudFormation スタックも、この 1 つのパラメータから決まる。
+#
+#   aws cloudformation deploy \
+#     --template-file github-oidc.yaml \
+#     --stack-name <project>-github-oidc \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides GitHubOwner=<owner> TargetEnvironment=prod ...
+#
+#   aws cloudformation describe-stacks --stack-name <project>-github-oidc \
+#     --query "Stacks[0].Outputs" --output table
+#
+# 出てきた ARN の登録先(どの GitHub Variables に何を入れるか)は README.md にまとめてある。
+
+Description: >-
+  <project>: GitHub Actions から OIDC で引き受ける最小権限のデプロイロール。
+  長期のアクセスキーを GitHub に置かないための土台。
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Default: "<owner>"
+    Description: >-
+      ワークフローを置くリポジトリの所有者(ユーザー名または組織名)。
+      リポジトリを移管したらここを更新してスタックを更新し直すこと。
+      更新しないと、次のデプロイで AssumeRole が失敗する。
+
+  # GitHub が発行する sub には、名前と **数値 ID の両方**が入る
+  # (repo:<owner>@<owner_id>/<repo>@<repo_id>:environment:<env>)。
+  # ID が入るのは、**同名のリポジトリを削除・再作成した相手になりすまされない**ため。
+  # 下の条件は StringEquals の完全一致なので、名前を変えたら結局ここも更新が要る。
+  #   gh api orgs/<owner> --jq .id          (個人アカウントなら users/<owner>)
+  #   gh api repos/<owner>/<repo> --jq .id
+  GitHubOwnerId:
+    Type: String
+    Default: ""
+    Description: >-
+      所有者の数値 ID。組織なら gh api orgs/<owner> --jq .id、
+      個人アカウントなら gh api users/<owner> --jq .id で取る。
+
+  AppRepoName:
+    Type: String
+    Default: "<app-repo>"
+    Description: >-
+      アプリ側リポジトリ名。到達形では既定ブランチへの push がデプロイの起点になるので、
+      Environment を通るデプロイもここから来る。
+
+  AppRepositoryId:
+    Type: String
+    Default: ""
+    Description: アプリ側リポジトリの数値 ID。gh api repos/<owner>/<app-repo> --jq .id で取る。
+
+  InfraRepoName:
+    Type: String
+    Default: "<infra-repo>"
+    Description: >-
+      インフラ定義側リポジトリ名(スタック定義・このテンプレート自身を置くリポジトリ)。
+      インフラ定義だけを変えるときの手動リリース用に、こちらも信頼する。
+
+  InfraRepositoryId:
+    Type: String
+    Default: ""
+    Description: インフラ定義側リポジトリの数値 ID。gh api repos/<owner>/<infra-repo> --jq .id で取る。
+
+  ProjectName:
+    Type: String
+    Default: "<project>"
+    Description: ロール名の接頭辞に使うプロジェクト名。
+
+  DefaultBranch:
+    Type: String
+    Default: master
+    Description: >-
+      アプリ側リポジトリの既定ブランチ名。stage だけに作る ECR push ロールが信頼する
+      sub(ref:refs/heads/<このブランチ>)に使う。Ruleset で保護しているブランチと一致させる。
+
+  # **このアカウントが担当する環境。** prod と stage は別の AWS アカウントに置く想定なので、
+  # 1 つのロールが両方の環境を受けることはない。
+  #
+  # 環境名 1 つから GitHub Environment 名とスタック名の**両方**を引く(下の Mappings)。
+  # 2 つを別々のパラメータで渡せる形にすると、**production の sub を信頼しながら
+  # stage のスタックだけ触れる**ようなちぐはぐな組み合わせを作れてしまう。
+  TargetEnvironment:
+    Type: String
+    Default: prod
+    AllowedValues: ["prod", "stage"]
+    Description: >-
+      このアカウントが担当する環境。prod なら production の Environment を信頼し、
+      対応するスタックだけを触れる。
+
+  AppEcrRepositoryName:
+    Type: String
+    Default: "<app-ecr-repo>"
+    Description: >-
+      アプリのイメージ用 ECR リポジトリ名(ecr-repository.yaml で作る名前と合わせる)。
+
+  StageAccountId:
+    Type: String
+    Default: ""
+    Description: >-
+      **prod アカウントで流すときだけ使う。** prod の GitHubDeployRole が stage の ECR から
+      pull するために必要な、stage アカウントの 12 桁 ID。TargetEnvironment=stage のときは未使用。
+
+  CreateOidcProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      token.actions.githubusercontent.com のプロバイダを作るか。
+      アカウント単位に 1 つしか持てないので、このアカウントで他プロジェクト用に
+      作成済みなら false にして ExistingOidcProviderArn を渡す。
+
+  ExistingOidcProviderArn:
+    Type: String
+    Default: ""
+    Description: CreateOidcProvider が false のときに使う既存プロバイダの ARN。
+
+Mappings:
+  # 環境名 → GitHub Environment 名 / CloudFormation スタック名 / ECS のロール名。
+  #
+  # **GitHubEnvironment はワークフローの `environment:` と、StackName はデプロイ先の
+  # スタック名と一致していること。** 前者がずれれば AssumeRoleWithWebIdentity で弾かれ、
+  # 後者がずれれば引き受けたあとに「権限が無い」で落ちる。
+  # TaskRoleName / ExecutionRoleName は ECS タスク定義のロール名と一致していること。
+  # **ずれると PassTaskRolesOnReregister の ARN が一致せず、
+  # スモーク失敗時のロールバックだけが Actions で落ちる。**
+  #
+  # **Mappings の値には !Sub が使えない(組み込み関数は Mappings の値として不可)。**
+  # そのため ProjectName パラメータではなく、下のプレースホルダ文字列を直に置いてある。
+  # 採用時にこの Mappings の値を実際の名前へ書き換えること(README 参照)。
+  EnvironmentConfig:
+    prod:
+      GitHubEnvironment: production
+      StackName: "<stack-name>"
+      TaskRoleName: "<project>-task-prod"
+      ExecutionRoleName: "<project>-exec-prod"
+    stage:
+      GitHubEnvironment: staging
+      StackName: "<stack-name>Stage"
+      TaskRoleName: "<project>-task-stage"
+      ExecutionRoleName: "<project>-exec-stage"
+
+Conditions:
+  ShouldCreateOidcProvider: !Equals [!Ref CreateOidcProvider, "true"]
+  IsStage: !Equals [!Ref TargetEnvironment, "stage"]
+  IsProd: !Equals [!Ref TargetEnvironment, "prod"]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      # 現在の IAM は GitHub のような公開 CA の証明書を自前の信頼ストアで検証するため
+      # この値を実際には見ない。それでもスキーマ上は必要なので既知の値を置いてある。
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-github-deploy
+      # IAM の description は ASCII 印字可能文字と Latin-1 補助しか受け付けず、
+      # 日本語は入らない(CloudFormation の Description とは別の制約)。
+      # ここだけ英語なのはそのため(日本語のままだと CREATE_FAILED になる)。
+      Description: >-
+        Role assumed by the GitHub Actions deploy / release workflows.
+        The resources themselves are created by the CDK bootstrap roles (or
+        equivalent), so this role only holds the right to assume them and the
+        read-only APIs that the deploy scripts call directly.
+      # 初回のデプロイは VPC / RDS / ALB / CloudFront / ECS などを一式作ることがある。
+      # 途中で資格情報が切れると失敗し、このロールには DeleteStack が無いので
+      # 後始末が手元作業になる。実際に取る長さはワークフロー側の
+      # role-duration-seconds で決める。
+      MaxSessionDuration: 7200
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - ShouldCreateOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Ref ExistingOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                # aud を固定しないと、他人のリポジトリのトークンでも
+                # 条件次第で通ってしまう組み合わせが生まれる。
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                # ワイルドカードにしない。`environment:*` にすると、
+                # 承認ゲートの無い Environment を新しく作るだけで本番ロールを引ける。
+                # 列挙する(StringEquals に配列を渡すと「いずれかに一致」)。
+                #
+                # **GitHub が実際に発行するのは ID 付きの形。** 参照実装で実測した:
+                #   repo:<owner>@<owner_id>/<repo>@<repo_id>:environment:staging
+                # 名前だけの従来形も残してあるのは、
+                # `gh api repos/<owner>/<repo>/actions/oidc/customization/sub` が
+                # `use_immutable_subject: false` を返すのに ID 付きが発行されており、
+                # **GitHub 側の既定が揺れている**ため。
+                #
+                # **アプリ側・インフラ側の両リポジトリの、このアカウントの担当環境だけを信頼する。**
+                # アプリとインフラを別リポジトリにした到達形では、デプロイの起点はアプリ側の
+                # push だが、インフラ定義だけを変える手動リリースはインフラ側から起動するため、
+                # 両方の sub を列挙する(ワイルドカードにはしない)。
+                token.actions.githubusercontent.com:sub:
+                  - !Sub
+                    - repo:${GitHubOwner}@${GitHubOwnerId}/${AppRepoName}@${AppRepositoryId}:environment:${Env}
+                    - Env: !FindInMap [EnvironmentConfig, !Ref TargetEnvironment, GitHubEnvironment]
+                  - !Sub
+                    - repo:${GitHubOwner}/${AppRepoName}:environment:${Env}
+                    - Env: !FindInMap [EnvironmentConfig, !Ref TargetEnvironment, GitHubEnvironment]
+                  - !Sub
+                    - repo:${GitHubOwner}@${GitHubOwnerId}/${InfraRepoName}@${InfraRepositoryId}:environment:${Env}
+                    - Env: !FindInMap [EnvironmentConfig, !Ref TargetEnvironment, GitHubEnvironment]
+                  - !Sub
+                    - repo:${GitHubOwner}/${InfraRepoName}:environment:${Env}
+                    - Env: !FindInMap [EnvironmentConfig, !Ref TargetEnvironment, GitHubEnvironment]
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # --- スタック本体を作る仕組み(CDK 前提。他の IaC なら読み替える) ------
+              # VPC も RDS も ECS も、実際に作るのはこの4つのロール。
+              # 名前にリージョンが入るので末尾はワイルドカードにしてある
+              # (IAM の ARN 自体はリージョンを持たないため、これで全リージョンを覆う)。
+              - Sid: AssumeCdkBootstrapRoles
+                Effect: Allow
+                Action: sts:AssumeRole
+                Resource:
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/cdk-hnb659fds-deploy-role-${AWS::AccountId}-*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/cdk-hnb659fds-file-publishing-role-${AWS::AccountId}-*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/cdk-hnb659fds-image-publishing-role-${AWS::AccountId}-*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/cdk-hnb659fds-lookup-role-${AWS::AccountId}-*
+
+              # デプロイスクリプトと CDK CLI 自身が、ブートストラップ済みかをこのパラメータで判定する。
+              #
+              # **読むだけで、bootstrap を実行する権限は与えていない。**
+              # bootstrap は IAM ロールと S3 バケットと ECR リポジトリを作る操作で、
+              # 必要な権限(iam:CreateRole / s3:CreateBucket / ecr:CreateRepository /
+              # ssm:PutParameter / CDKToolkit スタックへの cloudformation:CreateStack)を
+              # ここに足すと、このロールは実質アカウントの管理者になる。
+              # AWS アカウントに一度だけの操作なので、手元から済ませる前提にしてある。
+              - Sid: ReadBootstrapVersion
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:*:${AWS::AccountId}:parameter/cdk-bootstrap/hnb659fds/version
+
+              # --- スクリプトが直接叩くもの ---------------------------------
+              - Sid: WhoAmI
+                Effect: Allow
+                Action: sts:GetCallerIdentity
+                Resource: "*"
+
+              # 状態確認と、クラスタ・サービスの名前を引くための list-stack-resources。
+              #
+              # **このアカウントの担当スタック 1 本だけ。** `...Stack*` の 1 行で
+              # 済ませないのは、将来この接頭辞で始まる別のスタックを作ったときに
+              # 黙って対象へ入るため。
+              - Sid: ReadStacks
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ListStackResources
+                Resource:
+                  - !Sub
+                    - arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/${Stack}/*
+                    - Stack: !FindInMap [EnvironmentConfig, !Ref TargetEnvironment, StackName]
+                  - !Sub arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/CDKToolkit/*
+
+              # cloudformation:DeleteStack は意図的に与えていない。
+              #
+              # 前回の作成が ROLLBACK_COMPLETE で止まっているときの後始末は、
+              # 年に数えるほどしか起きない。恒常的な削除権限を Actions 側へ置くのは
+              # 割に合わないので、該当したら手元から片付ける。
+
+              # スモークテストが機械向けトークンを Secrets Manager から読む場合に使う。
+              # 使わないなら Policies から丸ごと外してよい。
+              #
+              # **名前ではなくタグで絞る。** CloudFormation が採番する論理名は
+              # スタック名を含まないことがあり(27 文字 + ランダムのような形)、
+              # 名前で絞ると環境やプロジェクトをまたいで衝突する。
+              # `aws:cloudformation:stack-name` タグは CloudFormation が自動で付けるので、
+              # スタックを作り直して名前が変わっても追従する。
+              - Sid: ReadStackSecrets
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub arn:${AWS::Partition}:secretsmanager:*:${AWS::AccountId}:secret:*
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/aws:cloudformation:stack-name:
+                      - !FindInMap [EnvironmentConfig, !Ref TargetEnvironment, StackName]
+
+              # 反映確認(タスク定義が入れ替わったか)と、スモーク失敗時のロールバック。
+              # クラスタ名は CloudFormation が <スタック名>-<論理ID>-<乱数> で採番するため
+              # 末尾はワイルドカードにせざるを得ない。
+              - Sid: InspectAndRollbackServices
+                Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:DescribeTasks
+                  - ecs:UpdateService
+                Resource:
+                  - !Sub
+                    - arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:cluster/${Stack}*
+                    - Stack: !FindInMap [EnvironmentConfig, !Ref TargetEnvironment, StackName]
+                  - !Sub
+                    - arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:service/${Stack}*/*
+                    - Stack: !FindInMap [EnvironmentConfig, !Ref TargetEnvironment, StackName]
+                  - !Sub
+                    - arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:task/${Stack}*/*
+                    - Stack: !FindInMap [EnvironmentConfig, !Ref TargetEnvironment, StackName]
+
+              # **ecs:ListTasks はリソースレベルの権限を持たない API。**
+              # Resource にクラスタやサービスの ARN を書いても一致せず、暗黙拒否になる。
+              # 絞るなら Resource を * にして、条件キー ecs:cluster を使う。
+              - Sid: ListTasksInStackClusters
+                Effect: Allow
+                Action: ecs:ListTasks
+                Resource: "*"
+                Condition:
+                  ArnLike:
+                    ecs:cluster:
+                      - !Sub
+                        - arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:cluster/${Stack}*
+                        - Stack: !FindInMap [EnvironmentConfig, !Ref TargetEnvironment, StackName]
+
+              # **ロールバック先を「番号」ではなく「中身」で持つために要る 2 つ。**
+              # ECS のネイティブ Blue/Green では、番号で戻す方式は成立しない
+              # (CloudFormation がタスク定義を更新するたび古いリビジョンを deregister するので、
+              # 戻す先が必ず INACTIVE になり update-service が受け付けない)。
+              # デプロイ前に稼働中の定義の中身を控え、失敗したらそれを登録し直して戻す想定。
+              #
+              # **どちらも ListTasks と同じくリソースレベルの権限を持たない API** なので
+              # Resource は * にするしかない(タスク定義の ARN を書いても一致せず暗黙拒否になる)。
+              - Sid: RollbackByReregisteringTaskDefinition
+                Effect: Allow
+                Action:
+                  - ecs:DescribeTaskDefinition
+                  - ecs:RegisterTaskDefinition
+                Resource: "*"
+
+              # register-task-definition は、その定義が指すロールを渡す権限まで要求する。
+              #
+              # **PassRole はタグで絞れない。名前(ARN)で絞る。**
+              # AWS のドキュメントが名指しで、「ロールにタグを付けて ResourceTag 条件で
+              # PassRole を制御しようとしないこと(信頼できる結果にならない)」と書いている。
+              # 使える条件キーは `iam:PassedToService` と `iam:AssociatedResourceArn` の 2 つだけ。
+              #   https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_passrole.html
+              #
+              # タグで絞ろうとして 2 段階で落とし穴を踏んだ経緯がある(参照実装で実測): IAM ロールには
+              # スタックの自動タグが付かないので `aws:cloudformation:stack-name` 条件では一致せず、
+              # 自前タグを付け直しても `simulate-principal-policy` は許可を返すのに実物は
+              # AccessDenied になった(条件キーをそのサービスが実際に埋めるかはシミュレータで
+              # 分からない)。**採番任せだと名前を書けない、が理由でタグへ逃げるのは避け、
+              # スタック側でロール名を固定で決め、この Mappings の名前と一致させる**。
+              #
+              # ECS のタスク以外へは渡せないよう PassedToService でも閉じる。
+              - Sid: PassTaskRolesOnReregister
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !Sub
+                    - arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Name}
+                    - Name: !FindInMap [EnvironmentConfig, !Ref TargetEnvironment, TaskRoleName]
+                  - !Sub
+                    - arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Name}
+                    - Name: !FindInMap [EnvironmentConfig, !Ref TargetEnvironment, ExecutionRoleName]
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+              # --- ここから ECR(到達形の本番昇格でだけ要る) -------------------
+              #
+              # 設計文書いわく「このコピーには権限が 2 か所要る。片方だけでは通らない」:
+              # stage 側はリポジトリポリシーで prod のこのロールに pull を許可し(ecr-repository.yaml)、
+              # prod 側は identity ベースでここに GetAuthorizationToken / pull / push を持つ。
+              # 今までのロールには ecr:* が 1 つも無いので、ECR を扱うのはこの 3 つの Statement だけ。
+              - !If
+                - IsProd
+                - Sid: EcrGetAuthorizationToken
+                  Effect: Allow
+                  # GetAuthorizationToken はリソースレベルの権限を持たない API で、
+                  # Resource は * にするしかない(docker login 相当の操作)。
+                  Action: ecr:GetAuthorizationToken
+                  Resource: "*"
+                - !Ref AWS::NoValue
+              - !If
+                - IsProd
+                - Sid: PullStageEcrForPromotion
+                  Effect: Allow
+                  # 本番昇格で、承認ゲートを通った後にこのロールが stage の ECR から
+                  # ダイジェスト指定で pull する(stage 側はリポジトリポリシーで許可するだけ)。
+                  Action:
+                    - ecr:BatchGetImage
+                    - ecr:GetDownloadUrlForLayer
+                    - ecr:BatchCheckLayerAvailability
+                  Resource: !Sub arn:${AWS::Partition}:ecr:*:${StageAccountId}:repository/${AppEcrRepositoryName}
+                - !Ref AWS::NoValue
+              - !If
+                - IsProd
+                - Sid: PushProdEcrAfterCopy
+                  Effect: Allow
+                  # pull してきたイメージを prod 自身の ECR へ push する。DescribeImages は
+                  # コピー後にダイジェストを突き合わせて同一性を確かめるために要る。
+                  Action:
+                    - ecr:PutImage
+                    - ecr:InitiateLayerUpload
+                    - ecr:UploadLayerPart
+                    - ecr:CompleteLayerUpload
+                    - ecr:BatchCheckLayerAvailability
+                    - ecr:DescribeImages
+                  Resource: !Sub arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/${AppEcrRepositoryName}
+                - !Ref AWS::NoValue
+              # stage 側は push しない(push ロールは別に GitHubEcrPushRole を作る)。
+              # ここでは、デプロイ前に「そのイメージが本当に ECR にあるか」を
+              # 確かめるための読み取りだけを持たせる。
+              - !If
+                - IsStage
+                - Sid: CheckOwnEcrImageBeforeDeploy
+                  Effect: Allow
+                  Action:
+                    - ecr:DescribeImages
+                    - ecr:BatchGetImage
+                  Resource: !Sub arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/${AppEcrRepositoryName}
+                - !Ref AWS::NoValue
+
+  # **stage にだけ作る。prod には作らない**(設計文書 2 章: 本番の ECR への push 権限を
+  # Environment を通らないジョブに持たせると、承認ゲートの無い経路から本番のロールを
+  # 引けないようにするという GitHubDeployRole の設計方針が崩れる)。
+  #
+  # push ロールは Environment を通らない(PR のジョブから直接引く)ので、今までのロールが
+  # 守っている「Environment を通ったジョブしか信頼しない」の例外になる。例外を作る以上、
+  # 設計文書の「次の 3 つで範囲を狭める」をそのまま適用する:
+  #   1. 信頼する sub は既定ブランチ(DefaultBranch)の push だけ(pull_request は信頼しない)
+  #   2. 権限は ECR の 1 リポジトリへの push だけ(CloudFormation・ECS・Secrets には触れない)
+  #   3. ECR リポジトリ側でタグをイミュータブルにする(ecr-repository.yaml)。
+  #      このロールが漏れても、検証済みの SHA と同じタグで別の中身を置けない
+  GitHubEcrPushRole:
+    Type: AWS::IAM::Role
+    Condition: IsStage
+    Properties:
+      RoleName: !Sub ${ProjectName}-github-ecr-push
+      Description: >-
+        Role assumed by the app repository's CI job on push to the default
+        branch, to push the built image to the stage ECR repository. Holds
+        ECR push permission only; no CloudFormation, ECS, or Secrets access.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - ShouldCreateOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Ref ExistingOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                # **既定ブランチ(DefaultBranch)の push だけ。Environment(environment:staging 等)を
+                # 経由しない例外ロールなので、ここが唯一の絞り込み。**
+                # pull_request イベントの sub(pull_request なら
+                # repo:<owner>/<repo>:pull_request)は列挙していないので信頼されない。
+                # 既定ブランチへの push は Ruleset(PR 必須・必須チェック)を通らないと
+                # 起きない想定なので、「CI が緑になった差分」だけがこのロールを引ける。
+                #
+                # **workflow_dispatch で起動しても sub は起動したブランチで決まる。**
+                # 「わざと壊したアプリを stage へ出す」(app_ref)は、既定ブランチのワークフローとして
+                # 起動して ref を入力で受けるから通る。壊れたブランチ側から起動すると弾かれる(それが正しい)。
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubOwner}@${GitHubOwnerId}/${AppRepoName}@${AppRepositoryId}:ref:refs/heads/${DefaultBranch}
+                  - !Sub repo:${GitHubOwner}/${AppRepoName}:ref:refs/heads/${DefaultBranch}
+      Policies:
+        - PolicyName: ecr-push
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EcrGetAuthorizationToken
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: PushAppImage
+                Effect: Allow
+                Action:
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:BatchCheckLayerAvailability
+                Resource: !Sub arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/${AppEcrRepositoryName}
+
+Outputs:
+  DeployRoleArn:
+    Description: >-
+      GitHub の Environment 変数 AWS_DEPLOY_ROLE_ARN に登録する値(app / infra 両リポジトリの、
+      このアカウントの担当環境に対応する Environment。prod なら production、stage なら staging)。
+    Value: !GetAtt GitHubDeployRole.Arn
+
+  EcrPushRoleArn:
+    Condition: IsStage
+    Description: >-
+      アプリ側リポジトリの変数に AWS_ECR_PUSH_ROLE_ARN として登録する値。stage アカウントでしか出ない。
+    Value: !GetAtt GitHubEcrPushRole.Arn
+
+  ExpectedSubjects:
+    Description: >-
+      GitHubDeployRole を引き受けられるジョブの条件(合わなければ AssumeRole が失敗する)。
+      実際に発行されるのは ID 付きの方。app / infra それぞれの sub をカンマ区切りで示す。
+    Value: !Join
+      - ", "
+      - - !Sub
+          - repo:${GitHubOwner}@${GitHubOwnerId}/${AppRepoName}@${AppRepositoryId}:environment:${Env}
+          - Env: !FindInMap [EnvironmentConfig, !Ref TargetEnvironment, GitHubEnvironment]
+        - !Sub
+          - repo:${GitHubOwner}@${GitHubOwnerId}/${InfraRepoName}@${InfraRepositoryId}:environment:${Env}
+          - Env: !FindInMap [EnvironmentConfig, !Ref TargetEnvironment, GitHubEnvironment]
