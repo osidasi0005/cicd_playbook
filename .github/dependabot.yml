@@ -1,0 +1,49 @@
+# 依存の更新 PR を Dependabot に作らせる。
+#
+# Renovate ではなく Dependabot を使う。Renovate は GitHub App のインストールが要るのに対し、
+# Dependabot はこのファイルだけで動き、private リポジトリでも追加課金が無い。
+#
+# **Dependabot が作った PR では Actions の Secret が読めない**(GitHub の仕様)。
+# 自動レビューを入れているリポジトリでは、依存更新の PR だけレビューが付かないので
+# 目視で確認してからマージする。auto-merge の対象にもしない。
+version: 2
+
+updates:
+  # ワークフローが使う action 自体の更新(actions/checkout@v7 など)。
+  # 放っておくと、ある日 GitHub 側で動かなくなる(Node 16 の action がそうだった)。
+  #
+  # **`templates/github/workflows/` の中の `uses:` は見てもらえない。**
+  # github-actions エコシステムが見るのは `.github/workflows/` と、directory で明示した
+  # composite action のディレクトリだけ。雛形側の action のバージョンは、採用先で上がる。
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      actions-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # 検査スクリプトの依存(js-yaml)。
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      npm-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
