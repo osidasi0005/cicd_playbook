@@ -1,0 +1,16 @@
+{
+  "name": "cicd_playbook",
+  "version": "0.1.0",
+  "private": true,
+  "description": "push から本番までの CI/CD の型を、次のプロジェクトへ持ち込める形でまとめたもの",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "node .github/scripts/check.mjs"
+  },
+  "devDependencies": {
+    "js-yaml": "^4.1.0"
+  }
+}
