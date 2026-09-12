@@ -47,3 +47,10 @@ updates:
       npm-minor-patch:
         patterns: ["*"]
         update-types: [minor, patch]
+    ignore:
+      # **js-yaml のメジャー更新は Dependabot に任せない。**
+      # 5 系は `yaml.Type` / `DEFAULT_SCHEMA.extend` の API が変わり、
+      # `.github/scripts/check-yaml.mjs` と `templates/aws/scripts/check-infra-templates.mjs` が
+      # 起動時に落ちる(4 → 5 の PR #3 で CI が赤になった)。上げるときは 2 本の移行作業として別に計画する。
+      - dependency-name: js-yaml
+        update-types: [version-update:semver-major]
