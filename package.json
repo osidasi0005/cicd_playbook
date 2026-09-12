@@ -11,6 +11,6 @@
     "check": "node .github/scripts/check.mjs"
   },
   "devDependencies": {
-    "js-yaml": "^4.1.0"
+    "js-yaml": "^5.4.1"
   }
 }
