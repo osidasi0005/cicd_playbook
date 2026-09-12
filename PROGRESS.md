@@ -59,7 +59,6 @@ node .github/scripts/check.mjs
 - security.yml の image-scan は deploy-stage の push と競走する(同じ master push で起動)。雛形にはコメントで注意を書き、確実にするなら後続ジョブへ移す
 
 **次にやること**
-- Dependabot PR #3 の扱い: 検査スクリプト 2 本を js-yaml 5 系 API へ移行してからマージするか、`dependabot.yml` で major を ignore する
 - 引き継ぎの 7(audio-shop-ec への適用)。着手順は `docs/adoption-checklist.md`。stage を立て直すところから(2026-09-13 時点で 3 アカウントとも稼働リソースなし)
 
 **費用・所要**
@@ -70,7 +69,7 @@ node .github/scripts/check.mjs
 ## 残課題
 
 - Ruleset / auto-merge が無い(Free の private)。public 化か Pro か、当面は PR 運用を手で守る
-- Dependabot PR #3(js-yaml 5)。上記
+- js-yaml は 4 系に留めている(`dependabot.yml` で major を ignore。PR #3 はユーザー指示で閉じた)。5 系へ上げるなら検査スクリプト 2 本の移行作業として別に計画する
 - 引き継ぎの 6: CDK の Blue/Green + alarms を construct に切り出す / スクリプトの固有値を設定ファイルへ(2 つ目の採用先ができてから)
 - 引き継ぎの 7: 最初の採用先として audio-shop-ec に適用する(実機検証込み。これをやらないと docs と雛形は机上のまま)
 - 雛形は実際に走らせていない(構文と固有名の検査だけ)。`actionlint` を入れると意味の検査が少し増える
