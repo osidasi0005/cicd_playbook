@@ -19,7 +19,7 @@ audio-shop-ec で設計した「push → CI → 自動マージ → stage 自動
 4. `docs/adoption-checklist.md` に、新プロジェクトへ入れる着手順と確認項目が載っている — 済
 5. `templates/github/workflows/` に、参照実装から一般化した workflow が揃っている(app: ci / security / claude-review / deploy-stage / promote-prod、infra: ci / security / claude-review / deploy-infra / release-infra) — 済
 6. `templates/aws/github-oidc.yaml` が app / infra の複数リポジトリを信頼できる形になっていて、SCP 3 本が写してある — 済
-7. すべて PR 経由で master に入っている — 済(ただし Ruleset は Free プランの private リポジトリでは作れず、直 push は機械的には止まっていない)
+7. すべて PR 経由で master に入っている — 済。public 化後に Ruleset「master 保護」(PR 必須、必須チェック「検査」、削除 / force push 禁止、squash のみ)と auto-merge を有効化した
 
 ## 検証コマンド
 
@@ -53,7 +53,7 @@ node .github/scripts/check.mjs
 - PR #5 GitHub 雛形: workflows app 5 本 / infra 5 本、setup-aws、check-node-version.mjs、dependabot.yml、README。あわせて README・AWS 側 README・adoption-checklist の整合
 
 **分かったこと**
-- 個人アカウントの Free プランでは、private リポジトリに Ruleset も auto-merge も作れない(403 / 設定が false のまま)。public にするか Pro にするかはユーザー判断
+- 個人アカウントの Free プランでは、private リポジトリに Ruleset も auto-merge も作れない(403 / 設定が false のまま)。ユーザーが public に変更し、その後は両方作れた(同日)
 - Dependabot が初日に js-yaml 4 → 5 のメジャー更新(PR #3)を出した。5 系は `yaml.Type` / `DEFAULT_SCHEMA.extend` の API が変わり、検査スクリプトが落ちる(CI が赤)。マージしていない
 - 検証コマンドを `| tail -1` で切ると終了コードが隠れる。チェーンでは直接実行する
 - security.yml の image-scan は deploy-stage の push と競走する(同じ master push で起動)。雛形にはコメントで注意を書き、確実にするなら後続ジョブへ移す
@@ -68,7 +68,6 @@ node .github/scripts/check.mjs
 
 ## 残課題
 
-- Ruleset / auto-merge が無い(Free の private)。public 化か Pro か、当面は PR 運用を手で守る
 - js-yaml は 4 系に留めている(`dependabot.yml` で major を ignore。PR #3 はユーザー指示で閉じた)。5 系へ上げるなら検査スクリプト 2 本の移行作業として別に計画する
 - 引き継ぎの 6: CDK の Blue/Green + alarms を construct に切り出す / スクリプトの固有値を設定ファイルへ(2 つ目の採用先ができてから)
 - 引き継ぎの 7: 最初の採用先として audio-shop-ec に適用する(実機検証込み。これをやらないと docs と雛形は机上のまま)
