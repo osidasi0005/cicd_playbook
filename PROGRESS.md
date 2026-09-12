@@ -31,7 +31,7 @@ node .github/scripts/check.mjs
 
 ## 前提(自分で決めたこと)
 
-- リポジトリは `osidasi0005/cicd_playbook`(private、個人アカウント)。ローカルは `C:\AI_loop_engineer\cicd_playbook`。ユーザー指示(2026-09-13)
+- リポジトリは `osidasi0005/cicd_playbook`(public、個人アカウント。Free プランで Ruleset を使うため同日 private から変更)。ローカルは `C:\AI_loop_engineer\cicd_playbook`。ユーザー指示(2026-09-13)
 - 参照実装への導線は GitHub の URL(引き継ぎの `../` 相対参照は、兄弟ディレクトリに無いので使えない)。ユーザー指示
 - 検証は Markdown / YAML の決定的な検査 4 つ(リンク切れ、Node 下限表記、YAML/JSON 構文、雛形の固有名)。`actionlint` は未導入なので入れない
 - Node 下限の正は `package.json` の `engines.node`(参照実装の `common.mjs` に相当するものがここには無い)
@@ -65,6 +65,39 @@ node .github/scripts/check.mjs
 - AWS 雛形(Sonnet サブエージェント): 140k トークン、25 ツール呼び出し、約 8 分
 - GitHub 雛形(Sonnet サブエージェント): 230k トークン、57 ツール呼び出し、約 16 分
 - 指揮役(Fable 5.1)は docs 3 本と箱を自分で書き、雛形 2 系統をレビュー(修正 5 点)
+
+## 採用 1: record_shop_ec_mono(引き継ぎの 7)
+
+対象はユーザー決定(2026-09-13)で `osidasi0005/record_shop_ec_mono`(public、main、モノレポ: mybatis / cdk / docs / spec / tests)。
+ローカルは `C:\AIの作業場\record_shop_ec_mono`。AWS は audio-shop と同じ prod / stage アカウント(SSO `audio-prod` / `audio-stage`)。
+
+**決めたこと(ユーザー)**: 検証のあいだだけ立てて終わったら destroy / 通知は Actions のメール / Blue/Green は今回入れない(案 B。ローリング更新 + サーキットブレーカー)/ Claude レビューは workflow だけ置きトークン登録は後で。
+**制約**: 手元の AWS CLI は `amazon/aws-cli` コンテナ。読み取りは通るが **CloudFormation deploy などの書き込みは自動モードの分類器に拒否される** → ユーザーが実行する(コマンドは `C:\AIの作業場\record-shop-ec-aws-commands.md`、手順は `record-shop-ec-cdk/infra/README.md`)。
+
+### 2026-09-13(深夜)
+
+**やったこと**
+- GitHub 設定: Ruleset「main 保護」(必須チェック 4 つ: ビルドとテスト / インフラのビルドとテスト / イメージをビルドする(push しない) / 差分レビュー)、Environments `staging` / `production`(承認者 osidasi0005、`v*` と `main` を許可)、auto-merge
+- PR #1 CI 一式(ci / security / claude-review / dependabot / CLAUDE.md / .nvmrc)。必須チェックが無い状態で auto-merge したため即マージされた(以後は必須チェックあり)
+- PR #6 cdk の作り直し(env で prod / stage、`imageRef` で ECR 参照、サーキットブレーカー、ロール名固定、awslogs、タグ、jest 15 件)と `infra/`(OIDC + ECR のテンプレートを埋めたもの)。mvnw の実行ビット(Docker ビルドが Permission denied で落ちた)
+- AWS: 両アカウントの OIDC プロバイダと bootstrap(v32)は済み。record-shop のリソースは未作成
+
+**分かったこと(雛形へ戻すもの)**
+- モノレポでは別リポジトリの checkout とトークンが要らず、OIDC の sub も app 側の 2 つだけでよい。雛形にモノレポの読み替えを 1 節足す
+- スタック側は `imageUri`(フル URI)より `imageRef`(タグまたはダイジェスト)+ `fromEcrRepository` の方がよい。実行ロールに pull 権限が自動で付き、ダイジェストも自動判別される。雛形の deploy-stage / promote-prod のコンテキスト名を合わせる
+- タスク定義を自作にすると ecs_patterns の既定 awslogs が消える。construct 化(6)のときの注意点
+- Ruleset の必須チェックは CI の PR より先に入れないと、auto-merge が即マージする(必須チェック名は CI が一度走らないと候補に出ないが、名前を直接書けば先に入れられる)
+- git の実行ビット: subtree で取り込んだ mvnw が 100644 のままで、Docker の COPY には CI の chmod が効かない
+- Trivy: alpine の openssl / libexpat と netty に HIGH / CRITICAL(修正版あり)。必須チェックにしていないので止まらない。Dependabot の PR で上がる分はユーザーが目視でマージ
+
+**次にやること(起きてから)**
+1. AWS の 4 回(ECR prod → OIDC prod → OIDC stage → ECR stage)をユーザーが実行
+2. Variables 登録(`record-shop-ec-aws-commands.md` の表。`gh api` で入れる)
+3. deploy-stage / promote-prod / setup-aws の PR(Sonnet が作成中)をマージ → main push で stage が立つことを実機で確認(初回は VPC / RDS / CloudFront 一式で 20〜30 分)
+4. `app_ref` で壊したイメージを出してサーキットブレーカーが戻すことを確認
+5. タグ `v*` → 承認 → prod。ダイジェスト一致をジョブ要約で確認
+6. stage と prod を destroy(`cdk destroy` も書き込みなので拒否される可能性。コマンドを用意する)
+7. 文書の追従(mono の README、docs の 04、tests 仕様書)、雛形の直しを cicd_playbook に戻す(上の「分かったこと」)
 
 ## 残課題
 
