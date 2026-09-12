@@ -1,0 +1,128 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# アプリのイメージ用 ECR リポジトリ。
+#
+# **アプリのスタックの外に置く。** アプリのスタック(CDK やその他 IaC)に含めて
+# destroy すると、リポジトリごと消えて再構築のたびに空になる。CI がビルドしたイメージを
+# 一度 push すれば、環境を作り直しても「そのアプリスタックが参照する既存イメージ」として
+# 使い続けたいので、寿命をアプリのスタックから切り離してある。
+# `DeletionPolicy: Retain` にしてあるのも同じ理由(スタックを削除してもリポジトリは残る。
+# 本当に消したいときは、先にリポジトリを空にしてから `aws ecr delete-repository --force`
+# を手元から実行する。README 参照)。
+#
+# stage アカウントでは、prod のデプロイロールからの pull を許可するリポジトリポリシーを
+# 追加で持つ(本番昇格が stage の ECR からダイジェスト指定で pull するため)。
+# prod アカウントでは何も追加しない(prod は自分の ECR に書くだけで、他アカウントに
+# 読ませる必要が無い)。
+#
+#   aws cloudformation deploy \
+#     --template-file ecr-repository.yaml \
+#     --stack-name <project>-ecr \
+#     --parameter-overrides RepositoryName=<app-ecr-repo> TargetEnvironment=stage \
+#       ProdDeployRoleArn=<prod アカウントの GitHubDeployRole の ARN>
+
+Description: <project> アプリのイメージ用 ECR リポジトリ(アプリのスタックの外に置く)。
+
+Parameters:
+  RepositoryName:
+    Type: String
+    Default: "<app-ecr-repo>"
+    Description: github-oidc.yaml の AppEcrRepositoryName と同じ名前にする。
+
+  ProdDeployRoleArn:
+    Type: String
+    Default: ""
+    Description: >-
+      **stage アカウントで、かつ本番昇格を組み込む段になってから使う。**
+      prod アカウントの github-oidc.yaml が出力する GitHubDeployRole の ARN。
+      空のままだと、TargetEnvironment=stage でもリポジトリポリシーは付かない
+      (prod のロールがまだ存在しない段階でも stage の ECR だけ先に作れるようにするため)。
+
+  TargetEnvironment:
+    Type: String
+    Default: prod
+    AllowedValues: ["prod", "stage"]
+    Description: このアカウントの担当環境。stage のときだけ ProdDeployRoleArn を評価する。
+
+Conditions:
+  IsStage: !Equals [!Ref TargetEnvironment, "stage"]
+  HasProdDeployRoleArn: !Not [!Equals [!Ref ProdDeployRoleArn, ""]]
+  ShouldAllowProdPull: !And [!Condition IsStage, !Condition HasProdDeployRoleArn]
+
+Resources:
+  AppEcrRepository:
+    Type: AWS::ECR::Repository
+    # 消し方は上のコメントと README を参照。空にしてから delete-repository --force。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      # **タグをイミュータブルにする。** 同じ SHA タグへの上書きを ECR 側で拒否させる。
+      # push ロール(github-oidc.yaml の GitHubEcrPushRole)が漏れても、
+      # 「検証済みの SHA と同じタグで別の中身を置く」ことができないようにするため。
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      # ライフサイクルの description は ASCII で書く(IAM の Description と同じ扱いにしておく。
+      # 日本語が通るかは実機でしか分からず、通らなければ CREATE_FAILED になる種類のもの)。
+      #   1. タグの付いていないイメージは 1 日で消す
+      #   2. test- 接頭辞のタグ(手動で壊れ方を注入する検証用)は 7 日で消す
+      #   3. それ以外は最新 30 個を残す(tagStatus: any は最後の優先度にする)
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 1 day",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 1
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Expire test-* images (manual rollback drills) after 7 days",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["test-"],
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 7
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 3,
+                "description": "Keep only the latest 30 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 30
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      # stage のときだけ、かつ prod のロール ARN が分かっているときだけ付ける。
+      RepositoryPolicyText: !If
+        - ShouldAllowProdPull
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: AllowProdDeployRolePull
+              Effect: Allow
+              Principal:
+                AWS: !Ref ProdDeployRoleArn
+              Action:
+                - ecr:BatchGetImage
+                - ecr:GetDownloadUrlForLayer
+                - ecr:BatchCheckLayerAvailability
+        - !Ref AWS::NoValue
+
+Outputs:
+  RepositoryUri:
+    Description: アプリのスタック(またはデプロイスクリプト)がイメージ参照に使う URI。
+    Value: !GetAtt AppEcrRepository.RepositoryUri
