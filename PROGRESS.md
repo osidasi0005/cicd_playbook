@@ -105,9 +105,13 @@ node .github/scripts/check.mjs
 - `imageUri` より `imageRef` + `fromEcrRepository`(pull 権限が自動、ダイジェスト自動判別)
 - 必須チェックは auto-merge より先に Ruleset へ(無いと即マージ)/ subtree 取り込みの `mvnw` は 100644 で Docker COPY に効かない / タスク定義自作で awslogs が消える / モノレポの読み替え / 実測値 3 つ
 
+**片付け(同日)**
+- stage と prod を `npx cdk destroy <スタック名> --context env=<env> --context imageRef=x --profile <profile>` で削除(手元の CDK + SSO で通った。自動モードの拒否は出なかった)。両方 `DELETE_COMPLETE`
+- 2 つを同時に流すと `cdk.out` の synth ロックで片方が動かない(終了コード 0 で「Another CLI is currently synthing」)。`--output` を分けるか直列にする
+- 残っているのは ECR(イメージ数枚)、OIDC ロール 2 スタック、CDKToolkit。稼働課金なし。ECR は次の採用でそのまま使える
+
 **残り**
-- stage と prod の destroy(ユーザーの返事待ち。`npx cdk destroy <スタック名> --context env=<env> --context imageRef=x`。自動モードで拒否されたらユーザーが実行)
-- `CLAUDE_CODE_OAUTH_TOKEN` の登録(`/install-github-app`。ユーザー)
+- `CLAUDE_CODE_OAUTH_TOKEN` の登録(`/install-github-app`。ユーザー)。登録するまで差分レビューはスキップ(緑)
 - Blue/Green とアラームは未導入(案 B)。6(construct 化)で持ち込む
 
 **費用・所要**
@@ -118,7 +122,7 @@ node .github/scripts/check.mjs
 
 - js-yaml は 4 系に留めている(`dependabot.yml` で major を ignore。PR #3 はユーザー指示で閉じた)。5 系へ上げるなら検査スクリプト 2 本の移行作業として別に計画する
 - **順番は 7 → 6**(ユーザー決定、2026-09-13)。6 は 7 で動いた形を切り出す
-- 引き継ぎの 7: 最初の採用先として audio-shop-ec に適用する(実機検証込み。これをやらないと docs と雛形は机上のまま)。着手順は `docs/adoption-checklist.md`
+- 引き継ぎの 7: **済**(採用先は audio-shop-ec ではなく record_shop_ec_mono。上の「採用 1」)。audio-shop-ec への適用は別件として未着手(cdk / mybatis の 2 リポジトリ構成なので、雛形の 2 リポジトリ前提をそのまま使う形になる)
 - 引き継ぎの 6: CDK の Blue/Green + alarms を construct に切り出す / スクリプトの固有値を設定ファイルへ。**7 の後**。置き方は npm パッケージではなく `templates/cdk/` にコピーして使うファイルから始める
 - 雛形は実際に走らせていない(構文と固有名の検査だけ)。`actionlint` を入れると意味の検査が少し増える
 - ECR の prod 側タグ(`v*`)は immutable なので、promote-prod を同じタグで再実行したときに push が通るか(同じダイジェストなら通るはず)は実機で確認する
