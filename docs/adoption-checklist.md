@@ -46,6 +46,11 @@ OIDC → アカウント分離 → build once → IaC → 既定ブランチ保�
 - [ ] Ruleset「既定ブランチ保護」: PR 必須、承認者 0 人、削除 / force push 禁止、bypass なし。
   必須チェックは決定的なものだけ(アプリ側「ビルドとテスト」「E2E(クリティカルパス)」「差分レビュー」/ インフラ側「ビルドとテスト」「差分レビュー」)。
   Trivy は入れない。**Free プランでは private リポジトリに Ruleset を作れない**
+- [ ] **必須チェックは、`allow_auto_merge` を有効にするより先に Ruleset へ入れる。** 必須チェックが
+  1 つも無い状態で auto-merge を有効にすると、PR がチェックの結果を待たずに即マージされる
+  (採用先で実際に起きた)。チェック名は CI が一度も走っていなくても Ruleset に直接書ける
+  (`name:` の文字列をそのまま入力する。候補一覧に出るのを待たなくてよい)ので、
+  「4. CI を入れる」で CI の PR を出す前に、この Ruleset の設定を済ませておく
 - [ ] `allow_auto_merge` を有効にする(同じく Free の private では使えない)
 - [ ] Variables: `AWS_REGION`、`STAGE_ECR_REGISTRY` / `PROD_ECR_REGISTRY`(`<account>.dkr.ecr.<region>.amazonaws.com`)
 - [ ] Secrets: `CLAUDE_CODE_OAUTH_TOKEN` は `/install-github-app` でしか登録できない(`claude setup-token` の出力を `gh secret set` する経路は 401)
@@ -68,7 +73,7 @@ OIDC → アカウント分離 → build once → IaC → 既定ブランチ保�
 
 ## 6. スタックを既存イメージ参照に変える(PR 3 本目)
 
-- [ ] `<infra-repo>` のスタックを `DockerImageAsset` から `ContainerImage.fromRegistry`(コンテキスト `imageUri`)へ。CI のダミー Dockerfile が消える
+- [ ] `<infra-repo>` のスタックを `DockerImageAsset` から `ecs.ContainerImage.fromEcrRepository`(コンテキスト `imageRef`。SHA タグ、または `sha256:` 始まりのダイジェスト)へ。CI のダミー Dockerfile が消える
 - [ ] `release-infra.yml` にイメージ URI の入力を足し、手動起動のまま「CI が焼いたイメージで stage に出る」ことを確かめる
 - [ ] デプロイスクリプトに「ECR に無ければ手元で焼いて push」を足す(初期構築用)
 - [ ] **ここで一度、実機で Blue/Green が回ることを確かめる。** イメージの出所が変わるだけで、CI が緑でもデプロイでしか出ない失敗はある
@@ -80,6 +85,13 @@ OIDC → アカウント分離 → build once → IaC → 既定ブランチ保�
 - [ ] `deploy-stage.yml` の `cdk deploy` ジョブを有効にする
 - [ ] スモークが落ちたときのロールバックを **Actions から** 一度流す(`app_ref` で壊したアプリを出す)。手元から流すと実行者の資格情報で通ってしまい、ロールの権限不足に気付けない
 - [ ] 通知先が決まっていること(決まっていないなら、このステップを入れない)
+
+**参照値(採用先で実測したもの。冒頭の「早い段階で 1 回だけまとめて実機を通す」の見積もりに使える。
+アカウントの状態やスタックの規模で変わるので目安):**
+
+- 手順 5〜7 の初回 stage 構築(VPC / RDS / ALB / CloudFront / ECS 一式が何も無い状態から): イメージ push 1 分 + `cdk deploy` 10 分
+- 手順 7 のロールバック検証(サーキットブレーカー発動 → `UPDATE_ROLLBACK_COMPLETE` まで): 20 分
+- 手順 9 の本番昇格(ダイジェスト指定でのコピー + 初回構築): 12 分
 
 ## 8. auto-merge を有効にする(設定変更)
 
@@ -114,3 +126,5 @@ OIDC → アカウント分離 → build once → IaC → 既定ブランチ保�
 | 別プロジェクトを destroy したら OIDC が通らなくなった | OIDC プロバイダはアカウントに 1 つで、先に作った側が持っている | 両側の README に書く。`CreateOidcProvider=false` で既存を指す |
 | メトリクスが黙って 0、アラームが鳴らない | インフラ側のメトリクスフィルタがアプリのログ文字列を直接見ている | 数えるのは「アプリがログにしか出さない語」。両側の CLAUDE.md に相互参照 |
 | 同じ SHA で別の中身が載った | ECR のタグが可変 | イミュータブル。同一性はダイジェストで |
+| `docker build` の `COPY` が Permission denied で落ちる(CI の `chmod +x` は通っているのに) | `subtree` や zip 経由で取り込んだファイル(`mvnw` など)が git 上 100644(実行不可)のままで、`COPY` は git のファイルモードをそのままイメージへ持ち込む。CI ジョブ内で `chmod +x` してもそのジョブのファイルシステム上でしか効かず、リポジトリ側のモードには反映されない | `git update-index --chmod=+x <path>` でリポジトリ側の実行ビットを直してコミットする |
+| ECS のタスクのログが CloudWatch Logs に出ない(ロググループが無い) | ロール名を固定するために `taskDefinition` を自分で用意して `ApplicationLoadBalancedFargateService` などの ecs_patterns construct に渡すと、`taskImageOptions` 経由の既定で付いていた awslogs のログ設定が付かなくなる | コンテナ定義で `logging: ecs.LogDrivers.awsLogs(...)` を明示する |

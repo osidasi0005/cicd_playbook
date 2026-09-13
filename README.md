@@ -50,6 +50,11 @@ CDK の construct(Blue/Green + alarms)とデプロイスクリプトは、まだ
 3. [docs/adoption-checklist.md](docs/adoption-checklist.md) の着手順に沿って入れる。AWS 側の適用順は [templates/aws/README.md](templates/aws/README.md)、
    GitHub 側の置き方とプレースホルダの一覧は [templates/github/README.md](templates/github/README.md)
 
+最初の採用先は [record_shop_ec_mono](https://github.com/osidasi0005/record_shop_ec_mono)(モノレポ)。
+2026-09-13 に、main への push → stage への自動反映、ECS サーキットブレーカーによるロールバック、
+タグ push → 承認 → 本番昇格(ダイジェスト一致の確認まで)を端から端まで実機で通した。
+そこで分かった知見(`setup-aws` の相対パス化、`imageRef` への切り替えなど)はこのリポジトリの雛形と文書に戻してある。
+
 ## 参照実装
 
 このリポジトリの雛形と文書は、次の実物から一般化した。雛形の中では固有名を書けないので、URL はここに集める。

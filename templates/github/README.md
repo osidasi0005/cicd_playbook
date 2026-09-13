@@ -39,6 +39,27 @@ scripts/
 dependabot.yml             <app-repo> と <infra-repo> の両方に置く(使わないブロックは削る)
 ```
 
+## 1 リポジトリ(モノレポ)の場合
+
+前提(2 リポジトリ構成)を 1 リポジトリ(アプリとインフラを 1 つのリポジトリで兼ねる)に
+読み替えるときの違い。
+
+- `workflows/app/` と `workflows/infra/` の中身を、同じ 1 つの `.github/workflows/` に
+  まとめて置く。ファイル名が重なるもの(`ci.yml` / `security.yml` / `claude-review.yml`)は、
+  片方の内容をもう片方のジョブへ統合する(採用先のサブプロジェクト構成に合わせてジョブを分ける)
+- 別リポジトリの checkout(`actions/checkout` の `repository:` / `token:` 指定)と、それに
+  使う `INFRA_REPO_TOKEN` は不要になる。既定の `GITHUB_TOKEN` による自分自身の checkout だけで、
+  アプリ側・インフラ側どちらのコードも手に入る
+- `actions/setup-aws` はリポジトリに 1 つだけ置き、`uses: ./.github/actions/setup-aws` の形で
+  呼ぶ(`<infra-repo>` の checkout も、`./<infra-repo>/.github/actions/setup-aws` の形も不要)。
+  インフラのコードがリポジトリ直下ではなくサブディレクトリにある場合は、`infra-dir` 入力に
+  そのサブディレクトリ名を渡す(直下にある場合は既定の `.` のままでよい)
+- OIDC の信頼ポリシー(`templates/aws/github-oidc.yaml`)の `sub` は、アプリ側の 2 つ
+  (`environment:staging` / `environment:production`)だけでよい。別リポジトリになる
+  インフラ側の分は要らない(`templates/aws/README.md` にも同じ注記がある)
+- 実例: [record_shop_ec_mono](https://github.com/osidasi0005/record_shop_ec_mono) の `.github/`
+  (最初にモノレポで採用したときの実装)
+
 ## プレースホルダの一覧と置き換え方
 
 すべて grep で見つけられる山括弧の形にしてある。
