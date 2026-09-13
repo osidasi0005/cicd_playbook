@@ -90,14 +90,29 @@ node .github/scripts/check.mjs
 - git の実行ビット: subtree で取り込んだ mvnw が 100644 のままで、Docker の COPY には CI の chmod が効かない
 - Trivy: alpine の openssl / libexpat と netty に HIGH / CRITICAL(修正版あり)。必須チェックにしていないので止まらない。Dependabot の PR で上がる分はユーザーが目視でマージ
 
-**次にやること(起きてから)**
-1. AWS の 4 回(ECR prod → OIDC prod → OIDC stage → ECR stage)をユーザーが実行
-2. Variables 登録(`record-shop-ec-aws-commands.md` の表。`gh api` で入れる)
-3. deploy-stage / promote-prod / setup-aws の PR(Sonnet が作成中)をマージ → main push で stage が立つことを実機で確認(初回は VPC / RDS / CloudFront 一式で 20〜30 分)
-4. `app_ref` で壊したイメージを出してサーキットブレーカーが戻すことを確認
-5. タグ `v*` → 承認 → prod。ダイジェスト一致をジョブ要約で確認
-6. stage と prod を destroy(`cdk destroy` も書き込みなので拒否される可能性。コマンドを用意する)
-7. 文書の追従(mono の README、docs の 04、tests 仕様書)、雛形の直しを cicd_playbook に戻す(上の「分かったこと」)
+### 2026-09-13(朝)— 端から端まで実機で通った
+
+**やったこと**
+- AWS の 4 回(ECR prod → OIDC prod → OIDC stage → ECR stage)はユーザーが実行。出力の ARN と Variables(`gh api` で登録)が一致することを確認
+- PR #7 deploy-stage / promote-prod / setup-aws をマージ → 初回は setup-aws の絶対パスで落ちた(PR #10 で相対パスに修正)→ 再実行で **stage 構築成功**(push 1 分 + deploy 10 分、`/actuator/health` UP)
+- ロールバック検証: 壊したイメージ(起動直後に exit 1)を `workflow_dispatch` の `app_ref` で出す → ECS サーキットブレーカー発動 → `UPDATE_ROLLBACK_COMPLETE` → 元のイメージで稼働継続(20 分)
+- タグ `v0.1.0` → production の承認(ユーザー)→ stage からダイジェスト指定で pull → prod へ push → **ダイジェスト一致** → prod 構築 → UP(12 分)。prod の `v0.1.0` と stage の SHA タグは同一ダイジェスト
+- Dependabot: PR #2/#5/#3(rebase 後)をマージ、#4(MyBatis major)は閉じて #8 で ignore
+- 文書の追従(mono PR #11)、雛形への戻し 8 点(このリポジトリ、下の PR)
+
+**分かったこと(雛形へ戻したもの)**
+- `actions/setup-node` の `node-version-file` は作業ディレクトリからの相対で解決され、絶対パスは二重になる → setup-aws は `infra-dir` 入力(既定 `.`)からの相対に
+- `imageUri` より `imageRef` + `fromEcrRepository`(pull 権限が自動、ダイジェスト自動判別)
+- 必須チェックは auto-merge より先に Ruleset へ(無いと即マージ)/ subtree 取り込みの `mvnw` は 100644 で Docker COPY に効かない / タスク定義自作で awslogs が消える / モノレポの読み替え / 実測値 3 つ
+
+**残り**
+- stage と prod の destroy(ユーザーの返事待ち。`npx cdk destroy <スタック名> --context env=<env> --context imageRef=x`。自動モードで拒否されたらユーザーが実行)
+- `CLAUDE_CODE_OAUTH_TOKEN` の登録(`/install-github-app`。ユーザー)
+- Blue/Green とアラームは未導入(案 B)。6(construct 化)で持ち込む
+
+**費用・所要**
+- サブエージェント(Sonnet): CI 一式 139k / cdk 作り直し 136k / deploy-stage 等 99k / 文書追従 130k / 雛形への戻し 148k トークン。調査(Haiku)80k
+- AWS: stage と prod を立てている間、1 環境あたり月 60〜90 ドル相当の日割り
 
 ## 残課題
 

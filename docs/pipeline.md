@@ -96,7 +96,10 @@ feature ブランチ ──最初の push で PR──▶ PR 上で push ごと�
     **ECR への push は「CI が緑になった差分」に限られる**
 12. 続けて `<infra-repo>` を checkout し、OIDC で `staging` Environment のデプロイ用ロールを引き受ける。
     `staging` には承認ゲートが無いので、ここで止まらない。
-    手順 11 で push 済みのイメージ URI(`<registry>/<app-ecr-repo>:<sha>`)をコンテキストで渡して `cdk deploy` する。
+    手順 11 で push 済みのイメージの SHA タグをコンテキスト `imageRef` で渡して `cdk deploy` する。
+    スタック側は `ecr.Repository.fromRepositoryName` で ECR リポジトリを引き当て、
+    `ecs.ContainerImage.fromEcrRepository(repository, imageRef)` で参照する
+    (フル URI ではなくタグ/ダイジェストで渡すことで、実行ロールへの pull 権限が自動で付く)。
     **テストは CI で済んでいるので再実行しない。Docker のビルドも走らない**
 13. ECS のネイティブ Blue/Green で切り替える。bake time 中に `deploymentAlarms` が鳴れば ECS が自分で戻す
 14. スモークテストを流し、失敗したら退避しておいたタスク定義へロールバックする。
@@ -116,7 +119,8 @@ feature ブランチ ──最初の push で PR──▶ PR 上で push ごと�
     `<infra-repo>` を checkout して手順 12 から 15 と同じ処理を流す。
     ビルドはしない。stage に載ったものと同じイメージが載る。
     prod と stage は別アカウントで ECR はアカウントごとのリソースなので、「同じイメージ」は自動には成立しない。
-    **同一性はタグではなくダイジェストで確かめる**(タグは付け替えられる)。`cdk deploy` にもダイジェスト(`@sha256:...`)で渡す
+    **同一性はタグではなくダイジェストで確かめる**(タグは付け替えられる)。`cdk deploy` にもコンテキスト
+    `imageRef` にダイジェスト(`sha256:...`)で渡す
 
 ---
 

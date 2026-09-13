@@ -49,7 +49,6 @@ jobs:
       contents: read
     outputs:
       image-tag: ${{ steps.tag.outputs.tag }}
-      registry: ${{ steps.ecr-login.outputs.registry }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -126,18 +125,22 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
+          infra-dir: <infra-repo>
 
-      # イメージ参照はコンテキスト変数 imageUri で渡す。スタック側は
-      # ContainerImage.fromRegistry(imageUri) のように、既存イメージの URI を
-      # そのまま受け取る前提(DockerImageAsset のようにこの場でビルドしない)。
+      # イメージ参照はコンテキスト変数 imageRef で渡す(SHA タグ、または "sha256:" で
+      # 始まるダイジェスト)。スタック側は ecr.Repository.fromRepositoryName で
+      # 既存の ECR リポジトリを引き当て、ecs.ContainerImage.fromEcrRepository(repository,
+      # imageRef) で参照する。フル URI を渡す ContainerImage.fromRegistry と違い、
+      # 実行ロールへの pull 権限が自動で付き、渡した値がタグかダイジェストかも
+      # 自動判別される(モノレポ採用先での実測)。
       # **テストは CI(app 側の ci.yml)で済んでいるので、ここでは再実行しない。**
       - name: cdk deploy する
         working-directory: <infra-repo>
         env:
-          IMAGE_URI: ${{ needs.build-and-push.outputs.registry }}/<app-ecr-repo>:${{ needs.build-and-push.outputs.image-tag }}
+          IMAGE_REF: ${{ needs.build-and-push.outputs.image-tag }}
         run: |
           set -euo pipefail
-          npx cdk deploy <stack-name>Stage --require-approval never --context imageUri="$IMAGE_URI"
+          npx cdk deploy <stack-name>Stage --require-approval never --context imageRef="$IMAGE_REF"
 
       - name: スモークテスト
         run: <smoke test command>

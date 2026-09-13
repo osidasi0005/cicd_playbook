@@ -6,15 +6,26 @@ description: >-
 # **この action は <infra-repo> に置く。**
 # 呼び出し元がアプリ側リポジトリ(<app-repo>)のワークフローなら、先に <infra-repo> を
 # path: <infra-repo> で checkout したうえで `uses: ./<infra-repo>/.github/actions/setup-aws`
-# の形で呼ぶ。呼び出し元がインフラ側リポジトリ(<infra-repo>)自身のワークフローなら、
-# 自分のリポジトリ内なので `uses: ./.github/actions/setup-aws` でよい。
+# の形で呼び、`infra-dir: <infra-repo>` を渡す。呼び出し元がインフラ側リポジトリ
+# (<infra-repo>)自身のワークフローなら、自分のリポジトリ内なので
+# `uses: ./.github/actions/setup-aws` でよく、`infra-dir` は省略してよい(既定 "."。
+# 1 リポジトリでアプリとインフラを兼ねる場合もこちらと同じ)。
 #
 # **参照実装との違い。** 参照実装ではこの action がアプリ側リポジトリを兄弟ディレクトリへ
 # 追加で checkout していた(スタックが DockerImageAsset としてアプリのソースを
 # ビルドコンテキストに使っていたため)。到達形ではスタックが ECR の既存イメージを
-# URI で参照するだけになるので、この action はアプリのソースを取得しない。
+# タグ/ダイジェストで参照するだけになるので、この action はアプリのソースを取得しない。
 # 呼び出し元(アプリ側ワークフロー)は、そもそも自分自身がアプリのソースを
 # 既にチェックアウト済みの状態でこの action を呼ぶ。
+#
+# **パスは呼び出し元ジョブの作業ディレクトリ(GITHUB_WORKSPACE)からの相対で書く。
+# 絶対パスにしない。** `actions/setup-node` の `node-version-file` /
+# `cache-dependency-path` は作業ディレクトリからの相対パスとして解決される。
+# 以前はここで `github.action_path` から3階層さかのぼって絶対パスを組み立てていたが、
+# `actions/setup-node` 側がその絶対パスの先頭にさらに作業ディレクトリを足してしまい、
+# 実機の初回実行で `.../<repo>/home/runner/work/.../.nvmrc does not exist` のように
+# パスが二重になって落ちた(モノレポ採用先での実測)。呼び出し元に <infra-repo> の
+# 相対位置を `infra-dir` 入力として渡してもらう形に直した。
 
 inputs:
   role-to-assume:
@@ -29,35 +40,31 @@ inputs:
       既定の 3600 で足りない初回構築だけ、呼ぶ側で延ばす。
     required: false
     default: "3600"
+  infra-dir:
+    description: >-
+      <infra-repo> のルートが、呼び出し元ジョブの作業ディレクトリから見てどこにあるか
+      (相対パス)。<infra-repo> 自身のワークフローから呼ぶとき、または 1 リポジトリで
+      アプリとインフラを兼ねるときは既定の "."(呼び出し元の作業ディレクトリそのもの)の
+      ままでよい。<app-repo> から checkout した <infra-repo> を指すときは、checkout の
+      path: に渡した値と同じ文字列(例: "<infra-repo>")を渡す。
+    required: false
+    default: "."
 
 runs:
   using: composite
   steps:
-    # このファイル自身(action.yml)は <infra-repo>/.github/actions/setup-aws/ にある。
-    # 呼び出し元は <infra-repo> という「名前」を自由に選べる(checkout の path: に何を
-    # 指定するかは呼ぶ側次第)ので、ここでは github.action_path から3階層さかのぼって
-    # 実際のチェックアウト先を求める(ハードコードすると採用先ごとに書き換えが要る)。
-    # setup-aws → actions → .github → <infra-repo のルート> の3段。
-    - name: <infra-repo> のチェックアウト先を特定する
-      id: paths
-      shell: bash
-      run: |
-        set -euo pipefail
-        infra_dir="$(cd "${{ github.action_path }}/../../.." && pwd)"
-        echo "infra_dir=${infra_dir}" >> "$GITHUB_OUTPUT"
-
     - name: Node.js を用意する
       uses: actions/setup-node@v7
       with:
         # バージョンは <infra-repo> の .nvmrc が正(呼び出し元の言語と違うことがあるので、
         # 明示的にこのパスを指す)。
-        node-version-file: ${{ steps.paths.outputs.infra_dir }}/.nvmrc
+        node-version-file: ${{ inputs.infra-dir }}/.nvmrc
         cache: npm
-        cache-dependency-path: ${{ steps.paths.outputs.infra_dir }}/package-lock.json
+        cache-dependency-path: ${{ inputs.infra-dir }}/package-lock.json
 
     - name: <infra-repo> の依存を入れる
       shell: bash
-      working-directory: ${{ steps.paths.outputs.infra_dir }}
+      working-directory: ${{ inputs.infra-dir }}
       run: npm ci
 
     # 長期のアクセスキーは置かない。ジョブごとに、期限つきの一時資格情報を取る。

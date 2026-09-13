@@ -39,6 +39,7 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
+          infra-dir: <infra-repo>
 
       # **このタグが指すコミットの SHA タグで、stage の ECR にはすでにイメージがある**
       # (deploy-stage.yml が master マージ後に push したもの)。まずそのダイジェストを控える。
@@ -97,16 +98,17 @@ jobs:
           fi
           echo "OK: ダイジェストが一致しています(${actual})"
 
-      # イメージ参照はダイジェストで渡す(タグではない)。スタック側は
-      # ContainerImage.fromRegistry(imageUri) のように、既存イメージの URI を
-      # そのまま受け取る前提。**テストは CI で済んでいるので、ここでは再実行しない。**
+      # イメージ参照はコンテキスト変数 imageRef にダイジェスト("sha256:..." 形式)で
+      # 渡す(タグではない)。スタック側は ecs.ContainerImage.fromEcrRepository(repository,
+      # imageRef) が "sha256:" で始まる文字列をダイジェストとして自動判別する。
+      # **テストは CI で済んでいるので、ここでは再実行しない。**
       - name: cdk deploy する
         working-directory: <infra-repo>
         env:
-          IMAGE_URI: ${{ vars.PROD_ECR_REGISTRY }}/<app-ecr-repo>@${{ steps.stage-image.outputs.digest }}
+          IMAGE_REF: ${{ steps.stage-image.outputs.digest }}
         run: |
           set -euo pipefail
-          npx cdk deploy <stack-name> --require-approval never --context imageUri="$IMAGE_URI"
+          npx cdk deploy <stack-name> --require-approval never --context imageRef="$IMAGE_REF"
 
       - name: スモークテスト
         run: <smoke test command>

@@ -89,6 +89,10 @@ stage へのデプロイ(`deploy-stage.yml`)は ECR ログイン時に返るレ�
 
 `templates/github/workflows/` 側の雛形はこの名前で読む。
 
+**1 リポジトリ(モノレポ)の場合**: `github-oidc.yaml` の `sub` はアプリ側リポジトリの分の 2 つ
+(`environment:staging` / `environment:production`)だけでよい。別リポジトリを前提にした
+インフラ側の `sub` は要らない。詳しくは `templates/github/README.md` の「1 リポジトリ(モノレポ)の場合」を参照。
+
 ## Mappings の値は手で置き換える
 
 `github-oidc.yaml` の `EnvironmentConfig`(Mappings)には `StackName` / `TaskRoleName` /
